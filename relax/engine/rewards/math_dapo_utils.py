@@ -183,6 +183,9 @@ def is_correct_minerva(
     # Extract answer from solution
     match = re.findall(answer_pattern, solution_str)
     extracted_answer = match[-1] if match else "[INVALID]"
+    boxed_answer = last_boxed_only_string(extracted_answer)
+    if boxed_answer is not None:
+        extracted_answer = remove_boxed(boxed_answer)
     pred = normalize_final_answer(extracted_answer)
 
     # Process ground truth
