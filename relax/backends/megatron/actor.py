@@ -64,6 +64,11 @@ from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
 from relax.utils.training import train_dump_utils
 from relax.utils.training.data_fields import build_data_fields
+from relax.utils.training.ppo_utils import (
+    INLINE_OLD_LOG_PROBS_KEY,
+    can_inline_first_step_old_log_probs,
+    requires_reference_log_probs,
+)
 from relax.utils.training.routing_replay import RoutingReplay
 from relax.utils.types import RolloutBatch
 from relax.utils.utils import (
@@ -85,6 +90,7 @@ from .data import (
     build_rollout_minibatch_plan,
     concat_rollout_batches,
     get_data_iterator,
+    get_data_iterator_step_suffix,
     log_perf_data,
     log_perf_data_fwd,
     log_rollout_data,
@@ -817,7 +823,7 @@ class MegatronTrainRayActor(TrainRayActor):
             )
 
             if should_compute_old_log_probs:
-                if "ref" in self.weights_backuper.backup_tags:
+                if requires_reference_log_probs(self.args) and "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                     self._switch_model("ref")
@@ -850,14 +856,64 @@ class MegatronTrainRayActor(TrainRayActor):
                             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
                         else:
                             os.environ["ROUTING_REPLAY_STAGE"] = "record"
-                    rollout_data.update(
-                        self.compute_log_prob(
+                    step_counts = rollout_data.get(ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY)
+                    inline_first_step = (
+                        isinstance(step_counts, list)
+                        and len(step_counts) == len(num_microbatches)
+                        and can_inline_first_step_old_log_probs(self.args, len(num_microbatches))
+                    )
+                    if inline_first_step:
+                        num_samples = len(rollout_data["total_lengths"])
+                        first_step_samples = step_counts[0]
+                        future_data_iterator, future_num_microbatches, _ = get_data_iterator_step_suffix(
                             data_iterator,
                             num_microbatches,
-                            store_prefix="",
-                            collect_topk=self.args.use_opd and self.args.opd_log_prob_top_k > 0,
+                            rollout_data,
+                            step_counts,
+                            start_step=1,
                         )
-                    )
+                        future_outputs = self.compute_log_prob(
+                            future_data_iterator,
+                            future_num_microbatches,
+                            store_prefix="",
+                        )
+                        rollout_data[INLINE_OLD_LOG_PROBS_KEY] = [True] * first_step_samples + [False] * (
+                            num_samples - first_step_samples
+                        )
+                        if mpu.is_pipeline_last_stage():
+                            future_log_probs = future_outputs["log_probs"]
+                            expected_future_samples = num_samples - first_step_samples
+                            if len(future_log_probs) != expected_future_samples:
+                                raise RuntimeError(
+                                    "Future-step old-logprob count does not match rollout suffix: "
+                                    f"got {len(future_log_probs)}, expected {expected_future_samples}"
+                                )
+                            rollout_log_probs = rollout_data.get("rollout_log_probs")
+                            if rollout_log_probs is None or len(rollout_log_probs) != num_samples:
+                                raise RuntimeError(
+                                    "Inline old-logprob mode requires one rollout_log_probs tensor per sample "
+                                    "for shape-compatible step-zero placeholders."
+                                )
+                            # Step zero ignores these placeholders and derives its
+                            # old policy from the training forward. The suffix is
+                            # cached before any optimizer update, preserving PPO.
+                            rollout_data["log_probs"] = rollout_log_probs[:first_step_samples] + future_log_probs
+                        logger.info(
+                            "[old-logprob] reusing step-zero train forward for %d/%d local samples; "
+                            "cached %d future-step samples before the first update",
+                            first_step_samples,
+                            num_samples,
+                            num_samples - first_step_samples,
+                        )
+                    else:
+                        rollout_data.update(
+                            self.compute_log_prob(
+                                data_iterator,
+                                num_microbatches,
+                                store_prefix="",
+                                collect_topk=self.args.use_opd and self.args.opd_log_prob_top_k > 0,
+                            )
+                        )
                     if self.args.use_rollout_routing_replay:
                         RoutingReplay.clear_all_forward()
 
@@ -1095,7 +1151,7 @@ class MegatronTrainRayActor(TrainRayActor):
 
         if self.args.compute_advantages_and_returns:
             # Ref forward
-            if "ref" in self.weights_backuper.backup_tags:
+            if requires_reference_log_probs(self.args) and "ref" in self.weights_backuper.backup_tags:
                 if self.args.use_routing_replay:
                     os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
                 self._switch_model("ref")

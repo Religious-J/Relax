@@ -1,13 +1,116 @@
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 
+from argparse import Namespace
+
 import pytest
 import torch
 
+from relax.utils.training.ppo_utils import (
+    INLINE_OLD_LOG_PROBS_KEY,
+    can_inline_first_step_old_log_probs,
+    get_grpo_returns,
+    requires_reference_log_probs,
+    use_inline_old_log_probs,
+)
 from relax.utils.training.ppo_utils import compute_approx_kl as _compiled_compute_approx_kl
-from relax.utils.training.ppo_utils import get_grpo_returns
 
 
 compute_approx_kl = torch.compiler.disable(_compiled_compute_approx_kl)
+
+
+@pytest.mark.parametrize(
+    ("kl_coef", "use_kl_loss", "kl_loss_coef", "expected"),
+    [
+        (0.0, False, 0.0, False),
+        (0.0, True, 0.0, False),
+        (0.1, False, 0.0, True),
+        (0.0, True, 0.1, True),
+    ],
+)
+def test_requires_reference_log_probs_only_for_effective_kl(kl_coef, use_kl_loss, kl_loss_coef, expected):
+    args = Namespace(
+        kl_coef=kl_coef,
+        use_kl_loss=use_kl_loss,
+        kl_loss_coef=kl_loss_coef,
+    )
+
+    assert requires_reference_log_probs(args) is expected
+
+
+def _inline_args(**overrides):
+    values = {
+        "colocate": True,
+        "fully_async": False,
+        "hybrid": False,
+        "loss_type": "policy_loss",
+        "compute_advantages_and_returns": True,
+        "true_on_policy_mode": False,
+        "kl_coef": 0.0,
+        "use_rollout_logprobs": False,
+        "keep_old_actor": False,
+        "use_opd": False,
+        "use_routing_replay": False,
+        "use_rollout_routing_replay": False,
+        "hidden_dropout": 0.0,
+        "attention_dropout": 0.0,
+        "num_experts": None,
+        "fp8": None,
+        "multimodal_keys": None,
+        "is_vl_model": False,
+        "custom_megatron_before_log_prob_hook_path": None,
+        "custom_megatron_before_train_step_hook_path": None,
+    }
+    values.update(overrides)
+    return Namespace(**values)
+
+
+def test_inline_first_step_old_log_probs_accepts_safe_multi_step_text_policy_loss():
+    assert can_inline_first_step_old_log_probs(_inline_args(), 2)
+
+
+@pytest.mark.parametrize(
+    ("override", "value"),
+    [
+        ("colocate", False),
+        ("fully_async", True),
+        ("hybrid", True),
+        ("loss_type", "value_loss"),
+        ("compute_advantages_and_returns", False),
+        ("true_on_policy_mode", True),
+        ("kl_coef", 0.1),
+        ("use_rollout_logprobs", True),
+        ("keep_old_actor", True),
+        ("use_opd", True),
+        ("use_routing_replay", True),
+        ("use_rollout_routing_replay", True),
+        ("hidden_dropout", 0.1),
+        ("attention_dropout", 0.1),
+        ("num_experts", 8),
+        ("fp8", "hybrid"),
+        ("multimodal_keys", ["pixel_values"]),
+        ("is_vl_model", True),
+        ("custom_megatron_before_log_prob_hook_path", "hooks.before_log_prob"),
+        ("custom_megatron_before_train_step_hook_path", "hooks.before_train"),
+        ("rollout_data_postprocess_path", "hooks.postprocess"),
+    ],
+)
+def test_inline_first_step_old_log_probs_rejects_non_equivalent_paths(override, value):
+    assert not can_inline_first_step_old_log_probs(_inline_args(**{override: value}), 2)
+
+
+def test_inline_first_step_old_log_probs_requires_more_than_one_train_step():
+    assert not can_inline_first_step_old_log_probs(_inline_args(), 1)
+
+
+def test_inline_old_log_probs_marker_is_uniform_per_microbatch():
+    assert not use_inline_old_log_probs({})
+    assert use_inline_old_log_probs({INLINE_OLD_LOG_PROBS_KEY: [True, True]})
+    assert not use_inline_old_log_probs({INLINE_OLD_LOG_PROBS_KEY: [False, False]})
+
+    with pytest.raises(RuntimeError, match="cannot mix inline and cached"):
+        use_inline_old_log_probs({INLINE_OLD_LOG_PROBS_KEY: [True, False]})
+    with pytest.raises(RuntimeError, match="non-empty sequence"):
+        use_inline_old_log_probs({INLINE_OLD_LOG_PROBS_KEY: []})
 
 
 def test_get_grpo_returns_broadcasts_rewards_to_token_shapes():

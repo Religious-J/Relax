@@ -31,6 +31,8 @@ from relax.utils.training.ppo_utils import (
     get_grpo_returns,
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
+    requires_reference_log_probs,
+    use_inline_old_log_probs,
 )
 from relax.utils.types import RolloutBatch
 
@@ -793,7 +795,7 @@ def policy_loss_function(
     else:
         advantages = batch["advantages"]
 
-    true_on_policy = getattr(args, "true_on_policy_mode", False)
+    true_on_policy = getattr(args, "true_on_policy_mode", False) or use_inline_old_log_probs(batch)
     # In true on-policy mode, actor_fwd is absent so batch["log_probs"] is missing;
     # old_log_probs is derived inline from this forward (assigned after the pass below).
     if not true_on_policy:
@@ -996,7 +998,7 @@ def policy_loss_function(
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 
-    if args.use_kl_loss:
+    if requires_reference_log_probs(args) and args.use_kl_loss:
         ref_log_probs = batch["ref_log_probs"]
         ref_log_probs = torch.cat(ref_log_probs, dim=0)
         importance_ratio = None
@@ -1011,6 +1013,11 @@ def policy_loss_function(
         kl_loss = sum_of_sample_mean(kl)
 
         loss = loss + args.kl_loss_coef * kl_loss
+    elif args.use_kl_loss:
+        # The configured KL term is multiplied by zero, so no reference
+        # forward is needed. Keep the metric schema stable while reporting the
+        # term's effective contribution.
+        kl_loss = log_probs.new_zeros(())
 
     opd_loss, opd_reported_loss = compute_policy_opd_loss(
         args=args,

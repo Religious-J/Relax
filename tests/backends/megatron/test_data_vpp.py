@@ -182,3 +182,55 @@ def test_get_data_iterator_balance_data_without_boundaries_uses_regular_steps(mo
     _, num_microbatches = data_module.get_data_iterator(args, object(), rollout_data)
 
     assert num_microbatches == [2, 2]
+
+
+def test_get_data_iterator_step_suffix_preserves_fixed_schedule(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    rollout_data = {
+        "total_lengths": list(range(8)),
+        "tokens": [f"sample-{i}" for i in range(8)],
+        "metadata": "shared",
+    }
+    iterator = data_module.DataIterator(rollout_data, micro_batch_size=2, max_tokens_per_gpu=1024)
+
+    suffix_iterators, suffix_num_microbatches, suffix_data = data_module.get_data_iterator_step_suffix(
+        [iterator],
+        [2, 2],
+        rollout_data,
+        [4, 4],
+        start_step=1,
+    )
+
+    assert suffix_num_microbatches == [2]
+    assert suffix_data["total_lengths"] == [4, 5, 6, 7]
+    assert suffix_data["metadata"] == "shared"
+    assert suffix_data[data_module.ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] == [4]
+    assert suffix_iterators[0].max_tokens_per_gpu == 1024
+    assert suffix_iterators[0].get_next(["tokens"])["tokens"] == ["sample-4", "sample-5"]
+
+
+def test_get_data_iterator_step_suffix_rebases_dynamic_indices(monkeypatch):
+    data_module = _load_data_module(monkeypatch)
+    rollout_data = {
+        "total_lengths": list(range(8)),
+        "tokens": [f"sample-{i}" for i in range(8)],
+    }
+    iterator = data_module.DataIterator(
+        rollout_data,
+        micro_batch_indices=[[2, 0], [3, 1], [6, 4], [7, 5]],
+        max_tokens_per_gpu=2048,
+    )
+
+    suffix_iterators, suffix_num_microbatches, _ = data_module.get_data_iterator_step_suffix(
+        [iterator],
+        [2, 2],
+        rollout_data,
+        [4, 4],
+        start_step=1,
+    )
+
+    suffix_iterator = suffix_iterators[0]
+    assert suffix_num_microbatches == [2]
+    assert suffix_iterator.micro_batch_indices == [[2, 0], [3, 1]]
+    assert suffix_iterator.max_tokens_per_gpu == 2048
+    assert suffix_iterator.get_next(["tokens"])["tokens"] == ["sample-6", "sample-4"]

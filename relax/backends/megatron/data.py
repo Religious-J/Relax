@@ -25,6 +25,7 @@ from relax.utils.opd.opd_utils import OPD_ROLLOUT_LOG_SKIP_FIELDS
 from relax.utils.timer import Timer
 from relax.utils.training import train_metric_utils
 from relax.utils.training.flops_counter import FlopsCounter
+from relax.utils.training.ppo_utils import INLINE_OLD_LOG_PROBS_KEY
 from relax.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -870,6 +871,92 @@ def get_data_iterator(
     )
 
 
+def get_data_iterator_step_suffix(
+    data_iterators: Sequence[DataIterator],
+    num_microbatches: Sequence[int],
+    rollout_data: RolloutBatch,
+    step_local_sample_counts: Sequence[int],
+    start_step: int,
+) -> tuple[list[DataIterator], list[int], RolloutBatch]:
+    """Build a suffix view while preserving the existing microbatch schedule.
+
+    This is used when a forward-only pass is needed only for later optimizer
+    steps. Re-running dynamic balancing would add collectives and could choose
+    a different schedule; instead, reuse and rebase the already-built indices.
+    """
+    if start_step <= 0 or start_step >= len(num_microbatches):
+        raise ValueError(f"start_step must select a non-empty proper suffix, got {start_step=}")
+    if len(step_local_sample_counts) != len(num_microbatches):
+        raise ValueError(
+            "step_local_sample_counts must match num_microbatches, "
+            f"got {len(step_local_sample_counts)} and {len(num_microbatches)}"
+        )
+    num_samples = len(rollout_data.get("total_lengths", []))
+    if sum(step_local_sample_counts) != num_samples:
+        raise ValueError(
+            "step_local_sample_counts must cover rollout_data, "
+            f"got sum={sum(step_local_sample_counts)}, samples={num_samples}"
+        )
+
+    sample_offset = sum(step_local_sample_counts[:start_step])
+    microbatch_offset = sum(num_microbatches[:start_step])
+
+    def _slice_sample_aligned(value):
+        if isinstance(value, (str, bytes)):
+            return value
+        if isinstance(value, (list, tuple)) and len(value) == num_samples:
+            return value[sample_offset:]
+        ndim = getattr(value, "ndim", None)
+        size = getattr(value, "size", None)
+        if ndim and ndim > 0 and callable(size):
+            try:
+                if int(size(0)) == num_samples:
+                    return value[sample_offset:]
+            except (TypeError, ValueError, IndexError):
+                pass
+        return value
+
+    suffix_rollout_data = {key: _slice_sample_aligned(value) for key, value in rollout_data.items()}
+    suffix_step_counts = list(step_local_sample_counts[start_step:])
+    suffix_rollout_data[ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY] = suffix_step_counts
+
+    suffix_iterators = []
+    suffix_num_samples = num_samples - sample_offset
+    for iterator in data_iterators:
+        if not isinstance(iterator, DataIterator):
+            raise TypeError(f"Expected DataIterator, got {type(iterator).__name__}")
+        if iterator.micro_batch_indices is None:
+            suffix_iterator = DataIterator(
+                suffix_rollout_data,
+                micro_batch_size=iterator.micro_batch_size,
+                max_tokens_per_gpu=iterator.max_tokens_per_gpu,
+            )
+        else:
+            if len(iterator.micro_batch_indices) != sum(num_microbatches):
+                raise ValueError(
+                    "micro_batch_indices must cover every scheduled microbatch, "
+                    f"got {len(iterator.micro_batch_indices)} and expected {sum(num_microbatches)}"
+                )
+            rebased_indices = [
+                [sample_index - sample_offset for sample_index in microbatch]
+                for microbatch in iterator.micro_batch_indices[microbatch_offset:]
+            ]
+            if any(
+                sample_index < 0 or sample_index >= suffix_num_samples
+                for microbatch in rebased_indices
+                for sample_index in microbatch
+            ):
+                raise ValueError("Suffix microbatch indices cross optimizer-step sample boundaries.")
+            suffix_iterator = DataIterator(
+                suffix_rollout_data,
+                micro_batch_indices=rebased_indices,
+                max_tokens_per_gpu=iterator.max_tokens_per_gpu,
+            )
+        suffix_iterators.append(suffix_iterator)
+
+    return suffix_iterators, list(num_microbatches[start_step:]), suffix_rollout_data
+
+
 def log_rollout_data(
     rollout_id: int,
     args: Namespace,
@@ -917,6 +1004,7 @@ def log_rollout_data(
                 ROLLOUT_MINI_LOCAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_GLOBAL_SAMPLE_COUNTS_KEY,
                 ROLLOUT_MINI_PROMPT_GROUP_COUNTS_KEY,
+                INLINE_OLD_LOG_PROBS_KEY,
             ]:
                 continue
             if args.use_opd and key in OPD_ROLLOUT_LOG_SKIP_FIELDS:

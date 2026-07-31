@@ -17,6 +17,62 @@ from relax.utils.logging_utils import get_logger
 logger = get_logger(__name__)
 
 
+INLINE_OLD_LOG_PROBS_KEY = "inline_old_log_probs"
+
+
+def requires_reference_log_probs(args: Namespace) -> bool:
+    """Return whether reference log-probs can affect rewards or gradients."""
+    reward_kl_enabled = getattr(args, "kl_coef", 0.0) != 0
+    loss_kl_enabled = getattr(args, "use_kl_loss", False) and getattr(args, "kl_loss_coef", 0.0) != 0
+    return reward_kl_enabled or loss_kl_enabled
+
+
+def can_inline_first_step_old_log_probs(args: Namespace, num_train_steps: int) -> bool:
+    """Return whether step zero can reuse its training forward as old policy.
+
+    Later optimizer steps still need log-probs captured before step zero
+    updates the actor. Keep this fast path deliberately narrow: the eval-mode
+    old-policy forward and train forward are interchangeable only for the
+    synchronous, deterministic dense-text path without custom hooks.
+    """
+    return (
+        num_train_steps > 1
+        and getattr(args, "colocate", False)
+        and not getattr(args, "fully_async", False)
+        and not getattr(args, "hybrid", False)
+        and getattr(args, "loss_type", None) == "policy_loss"
+        and getattr(args, "compute_advantages_and_returns", False)
+        and not getattr(args, "true_on_policy_mode", False)
+        and getattr(args, "kl_coef", 0.0) == 0
+        and not getattr(args, "use_rollout_logprobs", False)
+        and not getattr(args, "keep_old_actor", False)
+        and not getattr(args, "use_opd", False)
+        and not getattr(args, "use_routing_replay", False)
+        and not getattr(args, "use_rollout_routing_replay", False)
+        and getattr(args, "hidden_dropout", 0.0) == 0
+        and getattr(args, "attention_dropout", 0.0) == 0
+        and not getattr(args, "num_experts", None)
+        and not getattr(args, "fp8", None)
+        and getattr(args, "multimodal_keys", None) is None
+        and not getattr(args, "is_vl_model", False)
+        and getattr(args, "custom_megatron_before_log_prob_hook_path", None) is None
+        and getattr(args, "custom_megatron_before_train_step_hook_path", None) is None
+        and getattr(args, "rollout_data_postprocess_path", None) is None
+    )
+
+
+def use_inline_old_log_probs(batch: dict) -> bool:
+    """Validate a micro-batch marker and return whether it is fully inline."""
+    inline_flags = batch.get(INLINE_OLD_LOG_PROBS_KEY)
+    if inline_flags is None:
+        return False
+    if not isinstance(inline_flags, (list, tuple)) or not inline_flags:
+        raise RuntimeError(f"{INLINE_OLD_LOG_PROBS_KEY} must be a non-empty sequence.")
+    if any(inline_flags) and not all(inline_flags):
+        raise RuntimeError("A micro-batch cannot mix inline and cached old log-probs.")
+    return all(inline_flags)
+
+
 def validate_ppo_config(config: Namespace) -> None:
     if getattr(config, "advantage_estimator", None) != "ppo":
         return

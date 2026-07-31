@@ -35,6 +35,7 @@ from relax.utils.memory_utils import clear_memory
 from relax.utils.opd.opd_utils import consume_opd_train_data
 from relax.utils.timer import timer
 from relax.utils.training.ppo_utils import (
+    INLINE_OLD_LOG_PROBS_KEY,
     install_critic_value_head_runtime_check,
     maybe_verify_critic_value_head_movement,
     release_critic_lm_heads,
@@ -983,6 +984,7 @@ def train_one_step(
                     "advantages",
                     "returns",
                     "rollout_log_probs",
+                    INLINE_OLD_LOG_PROBS_KEY,
                     "max_seq_lens",
                     *_opd_keys,
                 ],
