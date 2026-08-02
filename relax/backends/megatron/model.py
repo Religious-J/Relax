@@ -1214,6 +1214,25 @@ def should_disable_forward_pre_hook(args: Namespace) -> bool:
     return args.use_distributed_optimizer and args.overlap_param_gather
 
 
+def _reset_adaptive_recompute(model: Sequence[DDP]) -> int:
+    """Opt patched transformer blocks into per-step memory calibration."""
+
+    resetters = []
+    for model_chunk in model:
+        for module in model_chunk.modules():
+            reset = getattr(module, "reset_adaptive_recompute", None)
+            if reset is not None:
+                resetters.append(reset)
+
+    # Multiple independently calibrated blocks would overwrite the process-wide
+    # CUDA peak counter and could enter WORLD collectives conditionally. Keep the
+    # optimization inert for VPP/MTP layouts until calibration is centralized.
+    if len(resetters) != 1:
+        return 0
+    resetters[0]()
+    return 1
+
+
 def train(
     rollout_id: int,
     model: Sequence[DDP],
@@ -1332,6 +1351,9 @@ def train(
     # Run training iterations till done.
     for step_id in range(num_steps_per_rollout):
         step_data_iterator = [data_iterator[step_id]] if use_step_iterators else data_iterator
+        # Recalibrate at the actual optimizer-step boundary. This is also the
+        # explicit opt-in that keeps an independently patched Megatron inert.
+        _reset_adaptive_recompute(model)
         # Run training step.
         with timer(f"train_micro_batch_{step_id}", keep=False):
             loss_dict, grad_norm = train_one_step(

@@ -177,6 +177,7 @@ class ReloadableProcessGroup(torch.distributed.ProcessGroup):
                 "for NCCL socket port release"
             )
             time.sleep(post_destroy_delay)
+        return destroyed_count
 
     @staticmethod
     def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):
@@ -337,8 +338,38 @@ def _should_skip_reload_and_destroy() -> bool:
 def destroy_process_groups(post_destroy_delay: float = 2.0):
     """Destroy all reloadable process groups."""
     if _should_skip_reload_and_destroy():
-        return
-    ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay)
+        return 0
+    return ReloadableProcessGroup.destroy_process_groups(post_destroy_delay=post_destroy_delay)
+
+
+@contextmanager
+def destroy_process_groups_deferred(post_destroy_delay: float = 2.0):
+    """Overlap the NCCL port-release cooldown with independent cleanup.
+
+    Process groups are destroyed before the context body runs. The usual
+    cooldown deadline is preserved, but only time not covered by the body is
+    slept on exit. This lets callers perform independent GPU-memory offload
+    while the OS releases NCCL sockets without weakening reload safety.
+    """
+
+    if post_destroy_delay < 0:
+        raise ValueError(f"post_destroy_delay must be non-negative, got {post_destroy_delay}")
+
+    destroyed_count = destroy_process_groups(post_destroy_delay=0)
+    cooldown_started = time.monotonic()
+    if destroyed_count > 0 and post_destroy_delay > 0:
+        logger.info(
+            f"Destroyed {destroyed_count} process groups; overlapping the "
+            f"{post_destroy_delay}s NCCL socket cooldown with independent cleanup"
+        )
+    try:
+        yield
+    finally:
+        if destroyed_count > 0 and post_destroy_delay > 0:
+            remaining = post_destroy_delay - (time.monotonic() - cooldown_started)
+            if remaining > 0:
+                logger.info(f"Waiting {remaining:.3f}s for the remaining NCCL socket cooldown")
+                time.sleep(remaining)
 
 
 def reload_process_groups(timeout_minutes: int = 30, max_retries: int = 3, retry_delay: float = 5.0):

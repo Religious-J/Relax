@@ -58,7 +58,12 @@ from relax.utils.opd.opd_utils import (
     consume_opd_train_data,
     has_managed_opd_teacher_manager,
 )
-from relax.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
+from relax.utils.reloadable_process_group import (
+    destroy_process_groups,
+    destroy_process_groups_deferred,
+    monkey_patch_torch_dist,
+    reload_process_groups,
+)
 from relax.utils.rotate_ckpt import rotate_ckpt
 from relax.utils.timer import Timer, inverse_timer, timer, with_defer
 from relax.utils.tracking_utils import init_tracking
@@ -398,10 +403,9 @@ class MegatronTrainRayActor(TrainRayActor):
             and hasattr(self.weight_updater, "disconnect_rollout_engines")
         ):
             self.weight_updater.disconnect_rollout_engines()
-        destroy_process_groups()
-
-        if self._torch_memory_saver_enabled:
-            torch_memory_saver.pause()
+        with destroy_process_groups_deferred():
+            if self._torch_memory_saver_enabled:
+                torch_memory_saver.pause()
 
         print_memory("after offload model")
 

@@ -1490,3 +1490,214 @@ diff --git a/megatron/bridge/peft/utils.py b/megatron/bridge/peft/utils.py
 +        if group is not None:
 +            return group
 +    return None
+diff --git a/megatron/core/transformer/transformer_block.py b/megatron/core/transformer/transformer_block.py
+index bd50bd7b4..639a2c87d 100644
+--- a/megatron/core/transformer/transformer_block.py
++++ b/megatron/core/transformer/transformer_block.py
+@@ -71,0 +72,52 @@
++
++
++_ADAPTIVE_RECOMPUTE_MIN_RESERVE_BYTES = 8 * 1024**3
++_ADAPTIVE_RECOMPUTE_RESERVE_FRACTION = 0.10
++
++
++@dataclass
++class _AdaptiveRecomputeState:
++    """Per-block calibration state for memory-budgeted recompute elision."""
++
++    phase: int = 0
++    calibration_layer_bytes: int = 0
++    calibration_input_numel: int = 0
++    planned_input_numel: int = 0
++    elided_layer_indices: Optional[Set[int]] = None
++
++
++def _evenly_spaced_layer_indices(num_layers: int, count: int) -> Set[int]:
++    """Choose ``count`` deterministic layer midpoints without front/back bias."""
++
++    if num_layers <= 0 or count <= 0:
++        return set()
++    count = min(count, num_layers)
++    return {((2 * index + 1) * num_layers) // (2 * count) for index in range(count)}
++
++
++def _memory_budgeted_elision_count(
++    *,
++    num_layers: int,
++    effective_free_bytes: int,
++    baseline_transient_bytes: int,
++    layer_activation_bytes: int,
++    total_bytes: int,
++) -> int:
++    """Return a conservative number of layers whose activations may be retained.
++
++    At most three quarters of the layers are retained.  The other quarter stays
++    checkpointed, and the calculation also reserves 10% of HBM (at least
++    8 GiB) after the calibrated baseline transient peak.
++    """
++
++    if num_layers < 2 or layer_activation_bytes <= 0 or total_bytes <= 0:
++        return 0
++    reserve_bytes = max(
++        _ADAPTIVE_RECOMPUTE_MIN_RESERVE_BYTES,
++        int(total_bytes * _ADAPTIVE_RECOMPUTE_RESERVE_FRACTION),
++    )
++    usable_bytes = max(
++        0,
++        effective_free_bytes - baseline_transient_bytes - reserve_bytes,
++    )
++    return min((num_layers * 3) // 4, usable_bytes // layer_activation_bytes)
+@@ -443,0 +496,65 @@
++
++    def reset_adaptive_recompute(self) -> None:
++        """Recalibrate the activation-memory budget on the next training step."""
++
++        self._adaptive_recompute_state = _AdaptiveRecomputeState()
++
++    def _adaptive_recompute_layers(self, current_input_numel: int) -> Optional[Set[int]]:
++        """Return the synchronized elision plan, or ``None`` while calibrating.
++
++        The first microbatch is a safe calibration pass.  It retains one
++        layer's activations and records the full forward/backward transient
++        peak.  With PP=DP=1, all ranks enter the second microbatch together, so
++        a pair of one-shot world reductions can use the most constrained rank's
++        HBM budget. Later microbatches reduce one scalar shape guard; no
++        collectives are added to the per-layer loop.
++        """
++
++        if (
++            not torch.cuda.is_available()
++            or not torch.distributed.is_initialized()
++            or parallel_state.get_pipeline_model_parallel_world_size() != 1
++            or parallel_state.get_data_parallel_world_size() != 1
++            or self.config.recompute_num_layers != 1
++            or self.num_layers_per_pipeline_rank < 2
++        ):
++            return set()
++
++        state = getattr(self, "_adaptive_recompute_state", None)
++        if state is None:
++            # The Megatron patch is inert unless its caller explicitly opts in
++            # by invoking reset_adaptive_recompute() at an optimizer-step boundary.
++            return set()
++
++        if state.phase == 0:
++            torch.cuda.reset_peak_memory_stats()
++            state.calibration_input_numel = current_input_numel
++            return None
++
++        if state.phase == 1:
++            current_allocated = torch.cuda.memory_allocated()
++            current_reserved = torch.cuda.memory_reserved()
++            driver_free, total_bytes = torch.cuda.mem_get_info()
++            effective_free = driver_free + max(0, current_reserved - current_allocated)
++            baseline_transient = max(
++                0,
++                torch.cuda.max_memory_allocated() - current_allocated,
++            )
++
++            minimums = torch.tensor(
++                [effective_free, total_bytes],
++                dtype=torch.int64,
++                device=torch.cuda.current_device(),
++            )
++            maximums = torch.tensor(
++                [
++                    baseline_transient,
++                    state.calibration_layer_bytes,
++                    current_input_numel,
++                    state.calibration_input_numel,
++                ],
++                dtype=torch.int64,
++                device=torch.cuda.current_device(),
++            )
++            torch.distributed.all_reduce(minimums, op=torch.distributed.ReduceOp.MIN)
++            torch.distributed.all_reduce(maximums, op=torch.distributed.ReduceOp.MAX)
+@@ -444,0 +562,46 @@
++            count = _memory_budgeted_elision_count(
++                num_layers=self.num_layers_per_pipeline_rank,
++                effective_free_bytes=int(minimums[0].item()),
++                baseline_transient_bytes=int(maximums[0].item()),
++                layer_activation_bytes=int(maximums[1].item()),
++                total_bytes=int(minimums[1].item()),
++            )
++            state.elided_layer_indices = _evenly_spaced_layer_indices(
++                self.num_layers_per_pipeline_rank,
++                count,
++            )
++            # The calibration shape is a hard upper bound: memory can grow
++            # superlinearly with sequence length in unfused attention/workspaces.
++            state.planned_input_numel = int(maximums[3].item())
++            state.phase = 2
++            if torch.distributed.get_rank() == 0:
++                reserve_gib = max(
++                    _ADAPTIVE_RECOMPUTE_MIN_RESERVE_BYTES,
++                    int(minimums[1].item() * _ADAPTIVE_RECOMPUTE_RESERVE_FRACTION),
++                ) / 1024**3
++                logger.warning(
++                    "Adaptive activation recompute retained %d/%d layers "
++                    "(calibrated %.2f GiB/layer, %.2f GiB HBM reserve)",
++                    count,
++                    self.num_layers_per_pipeline_rank,
++                    int(maximums[1].item()) / 1024**3,
++                    reserve_gib,
++                )
++            if int(maximums[2].item()) > state.planned_input_numel:
++                return set()
++
++        elif state.phase == 2:
++            # Dynamic batching may present a larger microbatch after calibration.
++            # All ranks must make the same checkpoint decision because the two
++            # paths execute collectives at different times during backward.
++            input_numel = torch.tensor(
++                current_input_numel,
++                dtype=torch.int64,
++                device=torch.cuda.current_device(),
++            )
++            torch.distributed.all_reduce(input_numel, op=torch.distributed.ReduceOp.MAX)
++            if int(input_numel.item()) > state.planned_input_numel:
++                return set()
++
++        return state.elided_layer_indices or set()
++
+@@ -553,0 +717,3 @@
++            adaptive_layers = self._adaptive_recompute_layers(hidden_states.numel())
++            calibration_layer = self.num_layers_per_pipeline_rank // 2
++            state = getattr(self, "_adaptive_recompute_state", None)
+@@ -555,2 +721,2 @@
+-                hidden_states, context = checkpoint_handler(
+-                    custom(layer_idx, layer_idx + self.config.recompute_num_layers)
++                chunk_end = min(
++                    layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
+@@ -557,0 +724,21 @@
++                calibrating_layer = adaptive_layers is None and layer_idx == calibration_layer
++                retain_activations = calibrating_layer or (
++                    adaptive_layers is not None and layer_idx in adaptive_layers
++                )
++                if retain_activations:
++                    allocated_before = torch.cuda.memory_allocated() if calibrating_layer else 0
++                    hidden_states, context = custom(layer_idx, chunk_end)(
++                        hidden_states,
++                        attention_mask,
++                        context,
++                        context_mask,
++                        rotary_pos_emb,
++                        padding_mask,
++                    )
++                    if calibrating_layer and state is not None:
++                        state.calibration_layer_bytes = max(
++                            hidden_states.numel() * hidden_states.element_size(),
++                            torch.cuda.memory_allocated() - allocated_before,
++                        )
++                else:
++                    hidden_states, context = checkpoint_handler(custom(layer_idx, chunk_end))
+@@ -561 +748 @@
+-                for idx in range(layer_idx, layer_idx + self.config.recompute_num_layers):
++                for idx in range(layer_idx, chunk_end):
+@@ -565 +752 @@
+-                        if idx == layer_idx + self.config.recompute_num_layers - 1:
++                        if idx == chunk_end - 1:
+@@ -569,0 +757,3 @@
++            if adaptive_layers is None and state is not None:
++                state.phase = 1
++
