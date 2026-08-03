@@ -1,3 +1,195 @@
+Status: Proposed  
+Author: @ldemon2333, @Religious-J  
+Task tracker: [Task 23 — Colocate 纯文本性能](https://github.com/redai-infra/Relax/issues/86)  
+Relax baseline: [0694cd536aa9bddb9cd78452585e7f56feebd6a2](https://github.com/redai-infra/Relax/commit/0694cd536aa9bddb9cd78452585e7f56feebd6a2)
+
+# [Performance] Reuse training process groups across TMS pause for immediate weight synchronization
+
+## 背景
+
+在 actor 与 rollout 共卡、并开启训练卸载的场景中，每个训练 step 都需要执行以下状态切换：
+
+```text
+actor training
+  → sleep/offload training model
+  → update weights to SGLang
+  → rollout
+  → wake up training model
+```
+
+当前实现为了保证 NCCL communicator 不在 TMS pause 期间持有失效资源，会在 `sleep()` 中销毁 Megatron 训练 process groups，并在 `update_weights()` 前重新创建。
+
+基线路径为：
+
+```text
+sleep()
+  → destroy 20 training process groups
+  → wait 2 s for NCCL socket release
+  → torch_memory_saver.pause()
+
+update_weights()
+  → reload 20 training process groups
+  → export weights to SGLang
+  → destroy training process groups again
+
+wake_up()
+  → torch_memory_saver.resume()
+  → reload training process groups
+```
+
+Profile 和运行日志显示，这组 destroy/reload 操作位于权重同步的关键路径上。它不改变传输的数据量，因此属于纯框架生命周期开销。
+
+## 优化思路
+
+在受支持的共卡权重同步场景中，训练 process groups 只需要跨越一个很短的窗口：
+
+```text
+sleep() → update_weights()
+```
+
+因此可以让训练 PG 在 TMS pause 后继续存活，直接用于紧接着发生的权重导出。权重同步结束后仍然销毁 PG，不让 communicator 常驻整个 rollout。
+
+优化后的生命周期为：
+
+```text
+sleep()
+  → verify all ranks can preserve PG
+  → Gloo barrier
+  → torch_memory_saver.pause()
+  → validate preserved communicators
+
+update_weights()
+  → reuse live training process groups
+  → export weights to SGLang
+  → destroy process groups once
+  → defer/overlap the NCCL release cooldown
+
+rollout
+  → process groups remain destroyed
+
+wake_up()
+  → torch_memory_saver.resume()
+  → reload training process groups
+```
+
+该方案减少了每 step 一次完整的训练 PG destroy/reload 循环，并将最后的 NCCL cooldown 移出权重同步关键路径。
+
+需要强调的是：这不是永久保留 NCCL process groups。PG 只在 `sleep()` 到紧接着的 `update_weights()` 之间复用，权重同步完成后仍会销毁。
+
+## 实现
+
+Prototype commit: [f98aa2bab591674b896183fff6b9f037bc0cbb2c](https://github.com/Religious-J/Relax/commit/f98aa2bab591674b896183fff6b9f037bc0cbb2c)
+
+### 1. 显式 PG 生命周期状态
+
+增加以下状态：
+
+```text
+PG_ACTIVE
+PG_PAUSED_LIVE
+PG_DESTROYED
+```
+
+用于区分：
+
+- PG 正常工作；
+- TMS 已 pause，但 PG 仍然可用；
+- PG 已销毁，需要重新创建。
+
+### 2. 保守的能力检查
+
+只有同时满足以下条件才允许复用：
+
+- actor role；
+- actor/rollout colocate；
+- `offload_train`；
+- per-step rollout；
+- Torch Memory Saver 已启用；
+- 使用 `UpdateWeightFromTensor` 本地 IPC 权重同步；
+- weights backuper 已启用；
+- pipeline parallel size 为 1；
+- 非 critic；
+- 非 fully-async；
+- 所有 reloadable process groups 当前均处于 active 状态；
+- 所有训练 rank 对复用决策达成一致。
+
+实验通过运行时开关控制：
+
+```text
+--preserve-train-process-groups-for-weight-sync
+```
+
+该开关只用于 A/B 验证，不改变训练或 rollout 参数。
+
+### 3. pause 后 communicator canary
+
+首次进入 PG reuse 路径时，会在 TMS pause 后对实际使用的非平凡通信组运行 `all_reduce` canary：
+
+- TP；
+- DP；
+- DP+CP；
+- CP；
+- EP；
+- ETP。
+
+每个 communicator 都验证：
+
+```text
+all_reduce(ones) == process group world size
+```
+
+随后通过 Gloo control group 汇总所有 rank 的执行结果。
+
+如果任意 communicator 失败：
+
+```text
+disable PG preservation
+→ destroy preserved groups
+→ fall back to the original destroy/reload lifecycle
+```
+
+### 4. 异常回收
+
+如果复用 PG 后的权重同步抛出异常，会立即销毁仍存活的训练 communicator，避免将半失效 PG 泄漏到 rollout 阶段。
+
+## 测试配置
+
+硬件与软件：
+
+- 8 × NVIDIA H20，97,871 MiB/GPU；
+- PyTorch 2.11.0+cu129；
+- CUDA 12.9；
+- NCCL 2.28.9；
+- A/B 实验使用同一 PG reuse worktree，唯一运行时差异为是否启用复用开关。
+
+模型与数据：
+
+```text
+Model: /workspace/models/Qwen3-30B-A3B
+Data:  /root/data/dapo-math-17k/dapo-math-17k.jsonl
+```
+
+训练入口：
+
+```bash
+bash scripts/training/text/run-qwen3-30B-A3B-8xgpu.sh
+```
+
+主要拓扑：
+
+- actor/rollout colocate on 8 GPUs；
+- training TP=4、CP=2、EP=8；
+- DeepEP flex dispatcher；
+- SGLang TP=8；
+- global batch size 256；
+- rollout batch size 32；
+- 8 samples per prompt；
+- CPU optimizer offload。
+
+A/B 两组使用相同代码、模型、数据及训练参数，训练脚本 SHA256 均为：
+
+```text
+1b6d15d7d08ef996907b689e8bed3508fa9b4f26fa8705addc4835d39185316d
 ```
 
 唯一差异：
