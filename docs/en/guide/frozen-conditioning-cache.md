@@ -1,8 +1,10 @@
 # Frozen Conditioning Cache
 
-Image-edit SFT can reuse deterministic outputs from frozen conditioning encoders when the same effective inputs appear again. Relax stores these tensors in a bounded, node-local file cache so workers on the same node can share them without retaining a separate CPU copy in each process.
+Image-generation SFT can reuse deterministic outputs from frozen conditioning encoders when the same effective inputs appear again. Relax stores these tensors in a bounded, node-local file cache so workers on the same node can share them without retaining a separate CPU copy in each process.
 
-The current integration is SenseNova image-edit LoRA SFT. It reuses the reference-image and text prefix KV tensors together with image-position indexes. Full-parameter SenseNova training keeps these computations online because the conditioning parameters are trainable. Other model adapters and RL paths need their own integration; this feature does not transfer conditions from SGLang or an RL rollout engine.
+Current integrations are SenseNova image-edit LoRA SFT and Qwen-Image text-to-image LoRA SFT. SenseNova reuses reference-image and text prefix KV tensors together with image-position indexes; Qwen-Image reuses frozen text embeddings through the same public cache. Full-parameter SenseNova training keeps these computations online because the conditioning parameters are trainable. Other model adapters and RL paths need their own integration; this feature does not transfer conditions from SGLang or an RL rollout engine.
+
+The launch recipe and branch-grouping controls below target SenseNova. See [Text-to-Image SFT](./t2i-sft.md) for Qwen-Image data, its independent encoder boundary and its launch script.
 
 ## Enable the SFT recipe
 

@@ -50,13 +50,17 @@ def model_fingerprint(model_path: str | Path) -> str:
     root = Path(model_path)
     selected = sorted(
         path
-        for path in root.iterdir()
+        for path in root.rglob("*")
         if path.is_file()
-        and (path.suffix == ".safetensors" or path.suffix == ".json" or path.name in {"merges.txt", "vocab.txt"})
+        and not any(part.startswith(".") for part in path.relative_to(root).parts)
+        and (
+            path.suffix in {".safetensors", ".json"}
+            or path.name in {"merges.txt", "vocab.txt", "tokenizer.model", "spiece.model", "sentencepiece.bpe.model"}
+        )
     )
     if not any(path.suffix == ".safetensors" for path in selected):
         raise ValueError("No safetensors checkpoint found for conditioning fingerprint")
-    return build_key({path.name: fingerprint_file(path) for path in selected})
+    return build_key({path.relative_to(root).as_posix(): fingerprint_file(path) for path in selected})
 
 
 def unanimous_ready(ready: bool, group: Any) -> bool:
