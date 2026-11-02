@@ -13,6 +13,8 @@ from typing import Any
 
 import torch
 
+from relax.models.generative_sft import ConditioningResolver, ConditioningSpec
+
 
 LORA_TARGETS = (
     "q_proj_mot_gen",
@@ -86,6 +88,9 @@ class SenseNovaSFTModel(torch.nn.Module):
         self.pipe = pipe
         self.training_mode = training_mode
         self.prefix_gradient_checkpointing = prefix_gradient_checkpointing
+        self.conditioning_cache: ConditioningResolver | None = None
+        self.conditioning_reuse_disabled = False
+        self.conditioning_reuse_disabled_reason: str | None = None
         if training_mode == "full":
             self._mark_fine_grained_modules()
 
@@ -111,6 +116,187 @@ class SenseNovaSFTModel(torch.nn.Module):
                 module.model.embed_tokens._fsdp_fine_grained = True
                 module.lm_head._fsdp_fine_grained = True
 
+    def _conditioning_parameters(self) -> list[tuple[str, torch.nn.Parameter]]:
+        dit = self.pipe.dit
+        parameters = [(f"vision.{name}", parameter) for name, parameter in dit.vision_model.named_parameters()]
+        parameters.extend(
+            (f"prefix.{name}", parameter)
+            for name, parameter in dit.language_model.model.named_parameters()
+            if "_mot_gen" not in name
+        )
+        return parameters
+
+    def conditioning_is_frozen(self) -> bool:
+        """Check the understanding path, excluding the changing generation
+        LoRA.
+
+        Prefix encoding calls the understanding projections and vision tower;
+        it never calls ``*_mot_gen`` modules. Parameter metadata remains safe
+        to inspect after FSDP wrapping and does not synchronize the device.
+        """
+        parameters = self._conditioning_parameters()
+        return bool(parameters) and not any(parameter.requires_grad for _, parameter in parameters)
+
+    def conditioning_state(self) -> dict[str, Any]:
+        """Declare private mutation metadata before entering the FSDP root.
+
+        FSDP swaps module attributes between sharded masters and full forward
+        views. The runtime must inspect this outside forward, when parameters
+        are sharded. Identities detect local replacement; they never enter a
+        shared key. Version reads do not copy or synchronize GPU contents.
+        """
+        parameters = {}
+        for name, parameter in self._conditioning_parameters():
+            local = parameter.to_local() if hasattr(parameter, "to_local") else parameter
+            parameters[name] = {
+                "identity": id(parameter),
+                "version": parameter._version,
+                "local_version": local._version,
+                "requires_grad": parameter.requires_grad,
+                "dtype": str(parameter.dtype),
+                "shape": tuple(parameter.shape),
+            }
+        return {
+            "frozen": bool(parameters) and not any(value["requires_grad"] for value in parameters.values()),
+            "parameters": parameters,
+        }
+
+    def _prepare_conditioning(self, data: dict[str, Any]) -> dict[str, Any]:
+        from .pipeline import SenseNovaU1ImageUnit_PromptEmbedder
+
+        return SenseNovaU1ImageUnit_PromptEmbedder.prepare_sft_inputs(self.pipe, data["prompt"], data["edit_image"])
+
+    def conditioning_spec(
+        self,
+        data: dict[str, Any],
+        shared: dict[str, Any],
+        *,
+        enabled: bool,
+        prepared_prefix: dict[str, Any] | None = None,
+    ) -> ConditioningSpec:
+        """Describe effective CPU encoder inputs, independently of file names.
+
+        Tokenizer mutations matter exactly when they change the encoder's token
+        IDs, special-token selection or position indexes. Compute uses the same
+        prepared tensors; it never tokenizes again after keying.
+        """
+        cacheable = self.conditioning_is_frozen()
+        dependencies: dict[str, Any] = {}
+        if enabled and cacheable:
+            import hashlib
+            import os
+
+            from .processing import (
+                IMAGE_PLACEHOLDER,
+                IMAGENET_MEAN,
+                IMAGENET_STD,
+                IMG_CONTEXT_TOKEN,
+                IMG_START_TOKEN,
+                NON_THINK_PREFIX,
+                SYSTEM_MESSAGE_FOR_GEN,
+            )
+
+            tokenizer = self.pipe.tokenizer
+            prepared = self._prepare_conditioning(data) if prepared_prefix is None else prepared_prefix
+            # Only freshly prepared CPU tensors may be inspected by keying.
+            if prepared["input_ids"].device.type != "cpu" or prepared["indexes"].device.type != "cpu":
+                raise ValueError("SenseNova conditioning keys require CPU encoder inputs")
+            references = data["edit_image"]
+            dependencies = {
+                "prompt": data["prompt"],
+                "references": [
+                    {
+                        "mode": image.mode,
+                        "size": list(image.size),
+                        "sha256": hashlib.sha256(image.tobytes()).hexdigest(),
+                    }
+                    for image in references
+                ],
+                "target_size": [shared["height"], shared["width"]],
+                "dtype": str(self.pipe.torch_dtype),
+                "tokenizer": {
+                    "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
+                    "input_ids": prepared["input_ids"][0].tolist(),
+                    "special_token_ids": dict(prepared["special_token_ids"]),
+                    "padding_side": getattr(tokenizer, "padding_side", None),
+                    "truncation_side": getattr(tokenizer, "truncation_side", None),
+                },
+                "prefix_indexes": prepared["indexes"].tolist(),
+                "reference_grid": prepared["grid_hw"].tolist() if prepared["grid_hw"] is not None else None,
+                "template": [
+                    SYSTEM_MESSAGE_FOR_GEN,
+                    NON_THINK_PREFIX,
+                    IMAGE_PLACEHOLDER,
+                    IMG_CONTEXT_TOKEN,
+                    IMG_START_TOKEN,
+                ],
+                "preprocessing": {
+                    "version": 2,
+                    "patch_size": self.pipe.dit.patch_size,
+                    "downsample_ratio": self.pipe.dit.downsample_ratio,
+                    "merge_size": self.pipe.dit.merge_size,
+                    "min_pixels": 512 * 512,
+                    "max_pixels": min(2048 * 2048, (4096 * 4096) // max(1, len(references))),
+                    "mean": list(IMAGENET_MEAN),
+                    "std": list(IMAGENET_STD),
+                    "resize": "pillow-default",
+                },
+                "attention": os.environ.get("RELAX_ATTENTION_IMPLEMENTATION", "flash_attention_2"),
+                "deterministic_attention": os.environ.get("RELAX_DETERMINISTIC_ATTENTION", "0"),
+            }
+        return ConditioningSpec("sensenova.prefix.v2", dependencies, cacheable)
+
+    @staticmethod
+    def _export_conditioning(positive: dict[str, Any], *, detach: bool) -> dict[str, torch.Tensor]:
+        features = {"indexes_image": positive["indexes_image"]}
+        for index, layer in enumerate(positive["past_key_values"].layers):
+            features[f"kv.{index}.key"] = layer.keys
+            features[f"kv.{index}.value"] = layer.values
+        return {name: tensor.detach() for name, tensor in features.items()} if detach else features
+
+    def _restore_conditioning(self, features: dict[str, torch.Tensor], height: int, width: int) -> dict[str, Any]:
+        from transformers.cache_utils import DynamicCache, DynamicLayer
+
+        from .processing import PATCH_SIZE
+
+        layers = self.pipe.dit.language_model.model.layers
+        expected = {"indexes_image"} | {
+            f"kv.{index}.{kind}" for index in range(len(layers)) for kind in ("key", "value")
+        }
+        if set(features) != expected:
+            raise ValueError("Cached SenseNova conditioning fields differ from the model")
+        indexes = features["indexes_image"]
+        if indexes.dtype != torch.long or indexes.shape != (3, (height // PATCH_SIZE) * (width // PATCH_SIZE)):
+            raise ValueError("Cached SenseNova image indexes have an invalid dtype or shape")
+        cache = DynamicCache()
+        prefix_length = None
+        for index, layer in enumerate(layers):
+            key, value = features[f"kv.{index}.key"], features[f"kv.{index}.value"]
+            attention = layer.self_attn
+            if (
+                key.ndim != 4
+                or key.shape != value.shape
+                or key.shape[0] != 1
+                or key.shape[1] != attention.num_key_value_heads
+                or key.shape[-1] != attention.head_dim
+                or key.dtype != self.pipe.torch_dtype
+                or value.dtype != key.dtype
+                or key.device != value.device
+                or key.device != indexes.device
+                or (prefix_length is not None and key.shape[2] != prefix_length)
+            ):
+                raise ValueError("Cached SenseNova prefix has an invalid dtype, device or shape")
+            prefix_length = key.shape[2]
+            # DynamicLayer.update (also used by ddp_cache_data construction)
+            # concatenates with an empty tensor on first use. Bind the existing
+            # immutable features to a fresh per-forward wrapper instead.
+            cache_layer = DynamicLayer()
+            cache_layer.keys, cache_layer.values = key, value
+            cache_layer.dtype, cache_layer.device = key.dtype, key.device
+            cache_layer.is_initialized = True
+            cache.layers.append(cache_layer)
+        return {"past_key_values": cache, "indexes_image": indexes}
+
     def forward(self, data: dict[str, Any]) -> torch.Tensor:
         image = data["image"]
         shared = {
@@ -124,11 +310,58 @@ class SenseNovaSFTModel(torch.nn.Module):
             "use_gradient_checkpointing_offload": False,
         }
         inputs = (shared, {"prompt": data["prompt"], "is_positive": True}, {"prompt": "", "is_positive": False})
-        # Only generation projections have adapters. Prefix/vision are frozen;
-        # never checkpoint the mutable prefix cache in this LoRA-only path.
-        with torch.no_grad() if self.training_mode == "lora" else nullcontext():
-            for unit in self.pipe.units:
-                inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
+        # Default generation-only LoRA leaves prefix/vision frozen. Custom
+        # targets or a later unfreeze must retain the conditioning graph.
+        frozen_prefix = self.conditioning_is_frozen()
+        with torch.no_grad() if self.training_mode == "lora" and frozen_prefix else nullcontext():
+            if self.conditioning_cache is None:
+                for unit in self.pipe.units:
+                    inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
+            else:
+                inputs = self.pipe.unit_runner(self.pipe.units[0], self.pipe, *inputs)
+                import time
+
+                prepare_started = time.perf_counter()
+                inputs[0]["prepared_prefix"] = self._prepare_conditioning(data)
+                spec = self.conditioning_spec(
+                    data,
+                    inputs[0],
+                    enabled=self.conditioning_cache.enabled,
+                    prepared_prefix=inputs[0]["prepared_prefix"],
+                )
+                record_prepare = getattr(self.conditioning_cache, "record_prepare", None)
+                if record_prepare is not None:
+                    record_prepare(time.perf_counter() - prepare_started)
+
+                def compute() -> dict[str, torch.Tensor]:
+                    condition_inputs = (dict(inputs[0]), dict(inputs[1]), dict(inputs[2]))
+                    # Numerical verification deliberately exercises the original
+                    # tokenizer/device-index path as its independent reference.
+                    # Performance runs never set force_online.
+                    if getattr(self.conditioning_cache, "force_online", False):
+                        condition_inputs[0].pop("prepared_prefix", None)
+                    for unit in self.pipe.units[1:3]:
+                        condition_inputs = self.pipe.unit_runner(unit, self.pipe, *condition_inputs)
+                    record_transfer = getattr(self.conditioning_cache, "record_input_transfer", None)
+                    if record_transfer is not None:
+                        record_transfer(
+                            sum(
+                                value.numel() * value.element_size()
+                                for name in ("edit_pixel_values", "edit_grid_hw")
+                                if isinstance(value := condition_inputs[0].get(name), torch.Tensor)
+                            )
+                        )
+                    return self._export_conditioning(condition_inputs[1], detach=spec.cacheable)
+
+                restored = self.conditioning_cache.resolve(
+                    spec,
+                    compute,
+                    lambda features: self._restore_conditioning(features, inputs[0]["height"], inputs[0]["width"]),
+                )
+                inputs[1].update(restored)
+                inputs[2].update(restored)
+                for unit in self.pipe.units[3:]:
+                    inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         return flow_matching_loss(self.pipe, {**inputs[0], **inputs[1]})
 
 
@@ -165,6 +398,14 @@ class SenseNovaSFTAdapter:
     def prepare_for_sharding(self, model: SenseNovaSFTModel) -> None:
         # Match the reference BF16 adapter initialization before FP32 masters.
         model.pipe.to(dtype=torch.bfloat16)
+        if model.training_mode == "lora":
+            dit = model.pipe.dit
+            # These modules are invoked through __call__, so independent FSDP
+            # boundaries load vision/text weights only on online encoding.
+            # The SFT generation path never calls the language-model head.
+            # Apply this policy equally to online and cached LoRA training.
+            for module in (dit.vision_model, dit.language_model.model.embed_tokens, dit.language_model.lm_head):
+                module._fsdp_fine_grained = True
 
     def on_device_ready(self, model: SenseNovaSFTModel, device: torch.device) -> None:
         # Never move the already sharded parameters through Module.to().
