@@ -22,6 +22,7 @@ logger = get_logger(__name__)
 __all__ = [
     "resolve_block_classes",
     "resolve_fine_grained_modules",
+    "resolve_module_groups",
     "fsdp2_wrap",
     "upcast_trainable_params",
     "offload_module_to_cpu",
@@ -68,6 +69,41 @@ def resolve_fine_grained_modules(model: torch.nn.Module) -> List[torch.nn.Module
     of a broad class such as ``Linear``.
     """
     return [module for module in model.modules() if getattr(module, "_fsdp_fine_grained", False)]
+
+
+def resolve_module_groups(model: torch.nn.Module) -> List[List[torch.nn.Module]]:
+    """Validate optional adapter-declared sibling communication groups.
+
+    Members must be called through ``Module.__call__``. Grouping siblings does
+    not move/register them again, so checkpoint names remain unchanged. Groups
+    and existing fine-grained boundaries must have disjoint module/parameter
+    ownership; their common parents are sharded afterwards.
+    """
+    declared = getattr(model, "_fsdp_module_groups", ())
+    if not isinstance(declared, (list, tuple)):
+        raise ValueError("_fsdp_module_groups must be a sequence of module sequences")
+    available = set(model.modules()) - {model}
+    owned_modules: set[torch.nn.Module] = set()
+    owned_parameters: set[torch.nn.Parameter] = set()
+    for module in resolve_fine_grained_modules(model):
+        owned_modules.update(module.modules())
+        owned_parameters.update(module.parameters())
+    groups = []
+    for members in declared:
+        if not isinstance(members, (list, tuple)) or not members:
+            raise ValueError("Each FSDP module group must be a nonempty module sequence")
+        group = []
+        for module in members:
+            if not isinstance(module, torch.nn.Module) or module not in available:
+                raise ValueError("FSDP group members must be non-root modules belonging to the model")
+            descendants, parameters = set(module.modules()), set(module.parameters())
+            if owned_modules.intersection(descendants) or owned_parameters.intersection(parameters):
+                raise ValueError("FSDP module groups must have disjoint module and parameter ownership")
+            owned_modules.update(descendants)
+            owned_parameters.update(parameters)
+            group.append(module)
+        groups.append(group)
+    return groups
 
 
 @torch.no_grad()
@@ -148,6 +184,7 @@ def fsdp2_wrap(
 
     block_classes = tuple(resolve_block_classes(model))
     fine_grained_modules = resolve_fine_grained_modules(model)
+    module_groups = resolve_module_groups(model)
     shard_targets: tuple = block_classes
     if block_classes and activation_checkpointing:
         from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -168,6 +205,8 @@ def fsdp2_wrap(
 
     for module in fine_grained_modules:
         fully_shard(module, **kwargs)
+    for modules in module_groups:
+        fully_shard(modules, **kwargs)
     if block_classes:
         for module in model.modules():
             if isinstance(module, shard_targets):
@@ -176,6 +215,7 @@ def fsdp2_wrap(
     logger.info(
         f"FSDP2 wrapped model; fine-grained modules: {len(fine_grained_modules)} "
         f"({sorted({type(m).__name__ for m in fine_grained_modules})}); "
+        f"module groups: {len(module_groups)}; "
         f"block classes: {[c.__name__ for c in block_classes]}; "
         f"activation_checkpointing={activation_checkpointing}, cpu_offload={cpu_offload}, "
         f"master_dtype={master_dtype}"

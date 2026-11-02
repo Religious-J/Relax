@@ -45,6 +45,7 @@ These settings are read by the image SFT runtime. The recipe exports them to the
 | `RELAX_CONDITION_CACHE_RUN_DIR` | Unset | New worker-visible directory for `events-rank*.jsonl`. Setting it also enables measurement. The recipe defaults to `${SAVE_DIR}/${EXP_NAME}/metrics`. |
 | `RELAX_CONDITION_VERIFY` | `0` | Compare the first effective training batch through online and cached paths. Requires caching and a run directory. Use a separate run from throughput measurement. |
 | `RELAX_CONDITION_VERIFY_RTOL` | `0.01` | Relative tolerance for loss, accumulated gradients, and FP32 parameter updates in the comparison. The recipe accepts values from `0` to `0.01`. |
+| `RELAX_CONDITION_VERIFY_SNAPSHOT` | `0` | Save per-rank reference gradients and FP32 updates after successful verification, for comparisons across configurations. Verification only. |
 | `RELAX_CONDITION_PREFETCH_DEPTH` | `0` | Maximum future conditioning entries to prefetch; zero disables it. The recipe also requires image prefetch. |
 | `RELAX_CONDITION_PREFETCH_MAX_BYTES` | `536870912` | Per-worker lease budget, including in-flight lookup reservations and consumer borrows. |
 
@@ -53,6 +54,12 @@ With all measurement settings unset and caching off, SFT uses its original onlin
 When using an HTTP proxy, exclude localhost, the Ray head, and internal node addresses through both `NO_PROXY` and `no_proxy` so Ray Jobs and node discovery reach the cluster directly.
 
 The comparison recipe uses BF16 computation, FP32 optimizer master weights, and LoRA rank/alpha 32 by default. Its other defaults and launch arguments are in [`run-sensenova-condition-cache.sh`](../../../scripts/training/diffusion/run-sensenova-condition-cache.sh). These are recipe choices, not global parser defaults.
+
+Two independent training controls are available in the recipe. `PREFIX_GRADIENT_CHECKPOINTING=0` disables activation recomputation; despite its name, this also controls the generation decoder. Measure its memory cost on the actual workload. `FSDP_BRANCH_GROUPS=1` sets `fsdp_branch_groups: true` in the SFT configuration and separates each decoder's understanding and generation modules into independent FSDP communication groups. An unused branch then avoids the whole-layer parameter all-gather. This option defaults off and requires all conditioning parameters to be frozen; full training or LoRA targets that train understanding fail explicitly before sharding. Do not unfreeze conditioning within an existing grouped FSDP instance: disable this option and create a new training task. The common FSDP runtime consumes adapter-owned declarations without SenseNova layer names.
+
+Apply these controls equally to online and cached runs. Report training-configuration improvements separately from cache gains instead of comparing an optimized cached run against an old online configuration.
+
+Optional reference snapshots are stored in the run's `reference-snapshots/` directory. They contain full effective-batch reduced gradients, actual FP32 `theta_after - theta_before`, and fingerprints of initial parameters, optimizer, inputs, and RNG. Rank files are atomically written and checksummed before publishing a complete manifest; failures restore the pre-verification training state. Snapshots are retained verification artifacts, outside the cache payload budget and cache cleanup. Leave this option off for throughput measurements.
 
 ## Reuse boundaries and invalidation
 
@@ -87,6 +94,8 @@ Payload and staging budgets apply to one training namespace on each node. Concur
 Concurrent writers share the staging budget. Each reserves capacity in a short critical section, performs CPU copies, serialization and file writes outside the namespace lock, then publishes atomically under the lock. Independent owner locks protect in-flight writes. Recovery removes abandoned temporary files and reservations; client close waits for active operations.
 
 Optional conditioning prefetch overlaps future file lookup and SHA verification with the current backward/update. It uses already decoded samples from the image queue; dependency preparation stays on the training thread. Actual forward rebuilds the content key and checks frozen state. One background reader charges complete file bytes until the consumer finishes its device copy. This extends shared mmap leases, without persistent GPU features or a pinned pool; device copies remain on the training thread. Longer leases can affect eviction under capacity pressure.
+
+Retained cursor positions in the sliding window reuse their scheduling hints. Leaving the window, an exception, or close discards those hints; their count is bounded by prefetch depth. Hints only schedule I/O and never authorize feature reuse by sample ID. Actual forward independently validates the input and frozen state.
 
 Consumption checks file identity, size and timestamps and falls back to synchronous lookup on changes; every new lookup still verifies the complete SHA. Close drains the reader before closing storage, including that work in lifecycle timing. `prefetch_hit` counts consumed results; `prefetch_stats` separately reports background reads, waits, discards and budget peaks. Speculative reads are not effective sample hits.
 

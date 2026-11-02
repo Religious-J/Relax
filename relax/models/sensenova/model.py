@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import os
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn as nn
@@ -534,8 +534,18 @@ class SenseNovaU1Model(nn.Module):
         update_cache: Any = True,
         use_gradient_checkpointing: Any = False,
         use_gradient_checkpointing_offload: Any = False,
+        token_type: Literal["understanding", "generation"] | None = None,
     ) -> Any:
-        if image_gen_indicators is None:
+        if token_type is not None:
+            if image_gen_indicators is not None:
+                raise ValueError("Specify either token_type or image_gen_indicators, not both")
+            if token_type not in ("understanding", "generation"):
+                raise ValueError("token_type must be 'understanding' or 'generation'")
+            # Homogeneous callers already know the token type; inspecting GPU
+            # indicators here would synchronize the host before every forward.
+            exist_non_image_gen_tokens = token_type == "understanding"
+            exist_image_gen_tokens = token_type == "generation"
+        elif image_gen_indicators is None:
             exist_non_image_gen_tokens = True
             exist_image_gen_tokens = False
         else:
@@ -1034,11 +1044,10 @@ class SenseNovaU1DiT(nn.Module):
         use_gradient_checkpointing_offload: Any = False,
     ) -> Any:
         batch_size, num_tokens = image_embeds.shape[0], image_embeds.shape[1]
-        image_gen_indicators = torch.ones((batch_size, num_tokens), dtype=torch.bool, device=image_embeds.device)
 
         hidden_states, _ = self.language_model.model(
             inputs_embeds=image_embeds,
-            image_gen_indicators=image_gen_indicators,
+            token_type="generation",
             indexes=indexes_image,
             attention_mask=None,
             past_key_values=past_key_values,

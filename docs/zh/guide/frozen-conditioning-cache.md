@@ -45,6 +45,7 @@ bash scripts/entrypoint/ray-job.sh \
 | `RELAX_CONDITION_CACHE_RUN_DIR` | 未设置 | 写入 `events-rank*.jsonl` 的全新 worker 可见目录；设置该变量也会启用测量。脚本默认使用 `${SAVE_DIR}/${EXP_NAME}/metrics`。 |
 | `RELAX_CONDITION_VERIFY` | `0` | 对首个有效训练 batch 比较在线与缓存路径，要求启用缓存并设置 run 目录。应与吞吐测量分开运行。 |
 | `RELAX_CONDITION_VERIFY_RTOL` | `0.01` | loss、累积梯度及 FP32 参数更新量的相对误差阈值。脚本接受 `0` 到 `0.01`。 |
+| `RELAX_CONDITION_VERIFY_SNAPSHOT` | `0` | 验证通过后保存参考在线路径的逐 rank 梯度和 FP32 更新量，供跨配置比较；仅用于数值验证。 |
 | `RELAX_CONDITION_PREFETCH_DEPTH` | `0` | 预取未来条件的最大条目数；为 0 时关闭。对照脚本要求同时开启图像预取。 |
 | `RELAX_CONDITION_PREFETCH_MAX_BYTES` | `536870912` | 每 worker 的预取 lease 字节上限，包含正在查找的预留和消费中的借用。 |
 
@@ -53,6 +54,12 @@ bash scripts/entrypoint/ray-job.sh \
 若设置了 HTTP 代理，应通过 `NO_PROXY` 和 `no_proxy` 将 localhost、Ray head 及节点内网地址排除，确保 Ray Jobs 和节点发现请求直接访问集群。
 
 对照脚本默认采用 BF16 计算、FP32 optimizer master，以及 rank/alpha 均为 32 的 LoRA。其他默认值和提交参数见 [`run-sensenova-condition-cache.sh`](../../../scripts/training/diffusion/run-sensenova-condition-cache.sh)。这些是示例配方的选择，并非全局参数解析器默认值。
+
+对照脚本还提供两个独立的训练执行开关。`PREFIX_GRADIENT_CHECKPOINTING=0` 关闭模型的激活重算；虽然名称包含 prefix，它也控制生成 decoder。显存开销需在实际负载上测量。`FSDP_BRANCH_GROUPS=1` 将 `fsdp_branch_groups: true` 写入 SFT 配置，把每层的理解和生成模块分成独立 FSDP 通信组，使未执行的分支不随整层聚合权重。该开关默认关闭，只允许条件分支全部冻结；full 或理解侧可训练的 LoRA 会在分片前明确报错。启用后不能在同一个 FSDP 实例中解冻条件分支，需关闭开关并重新创建训练任务。公共 FSDP runtime 消费适配层的分组声明，不依赖 SenseNova 层名。
+
+上述开关必须同时应用于在线和缓存对照，分别报告训练配置收益与缓存收益。不要把配置优化后的缓存路径与旧配置在线路径直接作为缓存增益对照。
+
+可选参考快照位于 run 目录的 `reference-snapshots/`。它保存完整有效 batch 归约后的梯度、真实 FP32 `theta_after - theta_before`，以及初始参数、optimizer、输入和 RNG 指纹。所有 rank 文件原子写入并校验后才发布 manifest；失败会恢复验证前的训练状态。快照是保留的验证产物，不计入缓存 payload 配额，也不会由缓存关闭逻辑删除；不应在吞吐实验中开启。
 
 ## 复用边界与失效
 
@@ -87,6 +94,8 @@ Worker 按训练 attempt 和节点共享 namespace。正常结束、取消或进
 多个 writer 共用 staging 总预算，在短临界区内预留容量，锁外执行 CPU 搬运、序列化和写文件，再短锁原子发布。独立 owner 锁保护在途写入，恢复逻辑回收失效 writer 的临时文件和预留；关闭 client 会等待读写结束。
 
 可选条件预取将未来样本的文件读取和 SHA 校验与当前反向/更新重叠。它只借用图像队列中已经解码的样本，依赖准备仍在训练线程执行，实际 forward 重新构造内容键并检查冻结状态。单个后台 reader 的预算按完整文件字节限制，消费中的 lease 直到 GPU 复制完成才归还。它不建立 GPU 常驻缓存或额外 pinned pool，GPU 搬运仍在训练线程执行；更长的 lease 可能影响容量不足时的淘汰。
+
+滑动窗口保留的同一预取游标只准备一次提示；离开窗口、异常或关闭后立即丢弃。提示数量受预取深度限制，仅用于安排 I/O，不能按 sample ID 授权特征复用；实际 forward 仍独立检查输入与冻结状态。
 
 消费预取结果前会检查文件身份、大小和时间戳，变化时回退同步查找；每次新查找仍做完整 SHA。退出先停止并等待后台 reader，再关闭缓存；后台工作和清理计入生命周期。`prefetch_hit` 统计实际消费数，`prefetch_stats` 单独报告后台读取、等待、丢弃和预算峰值，不能替代有效样本命中率。
 

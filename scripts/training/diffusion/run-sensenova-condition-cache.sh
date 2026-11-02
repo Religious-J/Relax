@@ -38,6 +38,7 @@ done
 export RELAX_CONDITION_CACHE="${RELAX_CONDITION_CACHE:-0}"
 export RELAX_CONDITION_PROFILE="${RELAX_CONDITION_PROFILE:-1}"
 export RELAX_CONDITION_VERIFY="${RELAX_CONDITION_VERIFY:-0}"
+export RELAX_CONDITION_VERIFY_SNAPSHOT="${RELAX_CONDITION_VERIFY_SNAPSHOT:-0}"
 export RELAX_CONDITION_VERIFY_RTOL="${RELAX_CONDITION_VERIFY_RTOL:-0.01}"
 export RELAX_CONDITION_CACHE_MAX_BYTES="${RELAX_CONDITION_CACHE_MAX_BYTES:-8589934592}"
 export RELAX_CONDITION_CACHE_DIR="${RELAX_CONDITION_CACHE_DIR:-}"
@@ -59,13 +60,14 @@ export IMAGE_PREFETCH_DEPTH IMAGE_PREFETCH_WORKERS
 export ATTENTION_IMPLEMENTATION="${ATTENTION_IMPLEMENTATION:-flash_attention_2}"
 export DETERMINISTIC_ATTENTION="${DETERMINISTIC_ATTENTION:-0}"
 export PREFIX_GRADIENT_CHECKPOINTING="${PREFIX_GRADIENT_CHECKPOINTING:-1}"
+export FSDP_BRANCH_GROUPS="${FSDP_BRANCH_GROUPS:-0}"
 
 I2I_CONFIG=$(python3 - <<'PY'
 import json
 import math
 import os
 
-for name in ("RELAX_CONDITION_CACHE", "RELAX_CONDITION_PROFILE", "RELAX_CONDITION_VERIFY", "DETERMINISTIC_ATTENTION", "PREFIX_GRADIENT_CHECKPOINTING"):
+for name in ("RELAX_CONDITION_CACHE", "RELAX_CONDITION_PROFILE", "RELAX_CONDITION_VERIFY", "RELAX_CONDITION_VERIFY_SNAPSHOT", "DETERMINISTIC_ATTENTION", "PREFIX_GRADIENT_CHECKPOINTING", "FSDP_BRANCH_GROUPS"):
     if os.environ[name] not in ("0", "1"):
         raise SystemExit(f"{name} must be 0 or 1")
 positive = ("DATASET_SIZE", "GPUS", "GPUS_PER_NODE", "STEPS", "MAX_PIXELS", "CONDITIONING_IMAGES", "IMAGE_PREFETCH_WORKERS")
@@ -93,7 +95,7 @@ except ValueError:
     raise SystemExit("RELAX_CONDITION_VERIFY_RTOL must be finite and between 0 and 0.01") from None
 if not math.isfinite(tolerance) or not 0 <= tolerance <= 0.01:
     raise SystemExit("RELAX_CONDITION_VERIFY_RTOL must be finite and between 0 and 0.01")
-print(json.dumps({
+config = {
     "data_root": os.environ["DATA_ROOT"],
     "dataset_size": int(os.environ["DATASET_SIZE"]),
     "max_pixels": int(os.environ["MAX_PIXELS"]),
@@ -103,7 +105,10 @@ print(json.dumps({
     "prefix_gradient_checkpointing": os.environ["PREFIX_GRADIENT_CHECKPOINTING"] == "1",
     "image_prefetch_depth": int(os.environ["IMAGE_PREFETCH_DEPTH"]),
     "image_prefetch_workers": int(os.environ["IMAGE_PREFETCH_WORKERS"]),
-}))
+}
+if os.environ["FSDP_BRANCH_GROUPS"] == "1":
+    config["fsdp_branch_groups"] = True
+print(json.dumps(config))
 PY
 )
 RUNTIME_ENV_JSON=$(python3 - <<'PY'
@@ -115,7 +120,7 @@ env = runtime.setdefault("env_vars", {})
 env.setdefault("PATH", os.environ["PATH"])
 for key in ("RELAX_CONDITION_CACHE", "RELAX_CONDITION_PROFILE", "RELAX_CONDITION_CACHE_MAX_BYTES",
             "RELAX_CONDITION_CACHE_DIR", "RELAX_CONDITION_CACHE_RUN_DIR", "RELAX_CONDITION_VERIFY",
-            "RELAX_CONDITION_VERIFY_RTOL", "RELAX_CONDITION_PREFETCH_DEPTH", "RELAX_CONDITION_PREFETCH_MAX_BYTES"):
+            "RELAX_CONDITION_VERIFY_RTOL", "RELAX_CONDITION_VERIFY_SNAPSHOT", "RELAX_CONDITION_PREFETCH_DEPTH", "RELAX_CONDITION_PREFETCH_MAX_BYTES"):
     env[key] = os.environ[key]
 print(json.dumps(runtime))
 PY

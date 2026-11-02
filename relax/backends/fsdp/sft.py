@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import random
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -152,6 +153,7 @@ class FSDPSFTTrainer:
                 raise FileExistsError("Output already contains SFT checkpoints; use --load or a fresh --save")
             seed_training(self.args.seed + self.rank)
         self.prefetch = None
+        self._conditioning_hints: dict[tuple[int, int, int], Any] = {}
         depth = config.get("image_prefetch_depth", 0)
         workers = config.get("image_prefetch_workers", 2)
         if type(depth) is not int or depth < 0 or type(workers) is not int or workers <= 0:
@@ -242,6 +244,7 @@ class FSDPSFTTrainer:
             raise
 
     def close(self) -> None:
+        self._conditioning_hints = {}
         if self.prefetch:
             self.prefetch.close()
         runtime = getattr(self, "conditioning", None)
@@ -252,16 +255,33 @@ class FSDPSFTTrainer:
         runtime = getattr(self, "conditioning", None)
         describe = getattr(self.actor.model, "conditioning_prefetch_spec", None)
         if self.prefetch is None or runtime is None or not runtime.prefetch_enabled or describe is None:
+            self._conditioning_hints = {}
             return
         try:
             # CPU decoding has already happened in the original image queue.
             # Only the training thread reads model/tokenizer state. The cache
             # executor receives content keys and never runs model collectives.
-            specs = [describe(data) for _, _, _, data in self.prefetch.ready_samples(runtime.prefetch_depth)]
-            runtime.prefetch_many(specs)
+            previous = getattr(self, "_conditioning_hints", {})
+            hints = {}
+            for step, micro, sample_id, data in self.prefetch.ready_samples(runtime.prefetch_depth):
+                ticket = (step, micro, sample_id)
+                # A hint only schedules speculative I/O. Forward independently
+                # keys the actual input and checks frozen dependencies again.
+                # Tickets are unique cursor positions, not feature cache keys.
+                hints[ticket] = previous[ticket] if ticket in previous else describe(data)
+            self._conditioning_hints = hints
+            runtime.prefetch_many(list(hints.values()))
         except Exception as error:
+            self._conditioning_hints = {}
             runtime.prefetch_many([])
             logger.warning("Conditioning lookahead skipped; retaining synchronous lookup: %s", error)
+
+    def _profile_range(self, name: str) -> Any:
+        return (
+            torch.profiler.record_function(name)
+            if getattr(self.args, "use_pytorch_profiler", False)
+            else nullcontext()
+        )
 
     def _train_step(self, step: int) -> None:
         from relax.backends.fsdp.actor import _collect_weight_sync_errors
@@ -307,7 +327,8 @@ class FSDPSFTTrainer:
             data, error = None, None
             read_started = time.monotonic()
             try:
-                data = self.prefetch.get(step, micro, sample_id) if self.prefetch else self.dataset[sample_id]
+                with self._profile_range("sft.data_wait"):
+                    data = self.prefetch.get(step, micro, sample_id) if self.prefetch else self.dataset[sample_id]
             except Exception as exc:
                 error = f"sample {sample_id}: {type(exc).__name__}: {exc}"
             data_wait += time.monotonic() - read_started
@@ -319,12 +340,15 @@ class FSDPSFTTrainer:
             if verify:
                 prepared.append((sample_id, data))
                 continue
-            loss = self.actor.model(data)
+            with self._profile_range("sft.forward"):
+                loss = self.actor.model(data)
             # The current resolver has consumed its entry. Replace the future
             # window now, allowing lookup/checksum to overlap backward/update.
-            self._prefetch_conditioning()
+            with self._profile_range("sft.conditioning_lookahead"):
+                self._prefetch_conditioning()
             torch._assert_async(torch.isfinite(loss), "Non-finite SFT loss")
-            (loss / len(ids)).backward()
+            with self._profile_range("sft.backward"):
+                (loss / len(ids)).backward()
             loss_sum.add_(loss.detach().float() / len(ids))
         lr = optimizer.param_groups[0]["lr"]
         if verify:
@@ -362,8 +386,10 @@ class FSDPSFTTrainer:
             norm = torch.tensor(report["actual_clip_norm"], device=self.actor.device, dtype=torch.float32)
             loss_sum.fill_(report["loss"]["actual"])
         else:
-            norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
-            optimizer.step()
+            with self._profile_range("sft.clip_gradients"):
+                norm = clip_sharded_gradients(self.parameters, self.args.clip_grad, self.group)
+            with self._profile_range("sft.optimizer"):
+                optimizer.step()
         self.scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         self.step += 1

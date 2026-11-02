@@ -84,6 +84,24 @@ def test_condition_prefetch_controls_reach_ray_workers(tmp_path):
     assert env["RELAX_CONDITION_PREFETCH_MAX_BYTES"] == "536870912"
 
 
+@pytest.mark.parametrize("enabled", ["0", "1"])
+def test_branch_groups_are_opt_in_without_changing_legacy_contract(tmp_path, enabled):
+    result = preview(tmp_path, FSDP_BRANCH_GROUPS=enabled)
+    assert result.returncode == 0, result.stderr
+    args = json.loads(result.stdout)
+    config = json.loads(args[args.index("--i2i-sft-config") + 1])
+    if enabled == "1":
+        assert config["fsdp_branch_groups"] is True
+    else:
+        assert "fsdp_branch_groups" not in config
+
+
+def test_invalid_branch_group_control_fails_before_submission(tmp_path):
+    result = preview(tmp_path, FSDP_BRANCH_GROUPS="yes")
+    assert result.returncode != 0
+    assert "FSDP_BRANCH_GROUPS" in result.stderr
+
+
 @pytest.mark.parametrize("overrides", [{"IMAGE_PREFETCH_DEPTH": "0"}, {"RELAX_CONDITION_PREFETCH_MAX_BYTES": "0"}])
 def test_condition_prefetch_requires_decoded_lookahead_and_capacity(tmp_path, overrides):
     result = preview(tmp_path, **({"IMAGE_PREFETCH_DEPTH": "4", "RELAX_CONDITION_PREFETCH_DEPTH": "2"} | overrides))
@@ -91,12 +109,19 @@ def test_condition_prefetch_requires_decoded_lookahead_and_capacity(tmp_path, ov
 
 
 def test_verify_flags_propagate_and_perf_can_disable_checkpoints(tmp_path):
-    result = preview(tmp_path, RELAX_CONDITION_VERIFY="1", RELAX_CONDITION_VERIFY_RTOL="0", SAVE_CHECKPOINTS="0")
+    result = preview(
+        tmp_path,
+        RELAX_CONDITION_VERIFY="1",
+        RELAX_CONDITION_VERIFY_RTOL="0",
+        RELAX_CONDITION_VERIFY_SNAPSHOT="1",
+        SAVE_CHECKPOINTS="0",
+    )
     assert result.returncode == 0, result.stderr
     args = json.loads(result.stdout)
     env = json.loads(args[args.index("--runtime-env-json") + 1])["env_vars"]
     assert env["RELAX_CONDITION_VERIFY"] == "1"
     assert env["RELAX_CONDITION_VERIFY_RTOL"] == "0"
+    assert env["RELAX_CONDITION_VERIFY_SNAPSHOT"] == "1"
     assert "--save" not in args
     assert "--save-interval" not in args
     assert not (tmp_path / "save").exists()

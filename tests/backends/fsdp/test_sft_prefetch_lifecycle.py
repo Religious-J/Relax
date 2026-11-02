@@ -74,6 +74,44 @@ def test_condition_lookahead_error_discards_window_and_preserves_online_fallback
     trainer.conditioning.prefetch_many.assert_called_once_with([])
 
 
+def test_condition_lookahead_reuses_only_retained_cursor_hints_and_stays_bounded():
+    trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
+    trainer.prefetch = Mock()
+    trainer.conditioning = SimpleNamespace(prefetch_enabled=True, prefetch_depth=2, prefetch_many=Mock())
+    describe = Mock(side_effect=lambda data: dict(data))
+    trainer.actor = SimpleNamespace(model=SimpleNamespace(conditioning_prefetch_spec=describe))
+    first, second, third = {"prompt": "a"}, {"prompt": "b"}, {"prompt": "a"}
+    trainer.prefetch.ready_samples.return_value = [(1, 0, 3, first), (2, 0, 9, second)]
+    trainer._prefetch_conditioning()
+    trainer._prefetch_conditioning()
+    assert describe.call_count == 2
+    trainer.prefetch.ready_samples.return_value = [(2, 0, 9, second), (3, 0, 3, third)]
+    trainer._prefetch_conditioning()
+    # A repeated sample at a different cursor is described independently.
+    assert describe.call_count == 3
+    assert set(trainer._conditioning_hints) == {(2, 0, 9), (3, 0, 3)}
+    assert trainer.conditioning.prefetch_many.call_args.args[0] == [second, third]
+    trainer.prefetch.ready_samples.return_value = []
+    trainer._prefetch_conditioning()
+    assert trainer._conditioning_hints == {}
+
+
+@pytest.mark.parametrize("outcome", ["disabled", "error", "close"])
+def test_condition_lookahead_drops_retained_hints_on_exit(outcome):
+    trainer = FSDPSFTTrainer.__new__(FSDPSFTTrainer)
+    trainer.prefetch = Mock()
+    trainer.prefetch.ready_samples.return_value = [(2, 0, 9, {})]
+    trainer._conditioning_hints = {(1, 0, 3): object()}
+    trainer.conditioning = SimpleNamespace(
+        prefetch_enabled=outcome != "disabled", prefetch_depth=2, prefetch_many=Mock(), close=Mock()
+    )
+    trainer.step = 1
+    describe = Mock(side_effect=ValueError("bad speculative input"))
+    trainer.actor = SimpleNamespace(model=SimpleNamespace(conditioning_prefetch_spec=describe))
+    trainer.close() if outcome == "close" else trainer._prefetch_conditioning()
+    assert trainer._conditioning_hints == {}
+
+
 def test_sft_metrics_flush_exact_completed_step(monkeypatch):
     tracking = ModuleType("relax.utils.tracking_utils")
     calls = []

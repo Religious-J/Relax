@@ -83,15 +83,22 @@ class SenseNovaSFTModel(torch.nn.Module):
 
     _no_split_modules = ("SenseNovaU1DecoderLayer",)
 
-    def __init__(self, pipe: Any, training_mode: str = "lora", prefix_gradient_checkpointing: bool = True) -> None:
+    def __init__(
+        self,
+        pipe: Any,
+        training_mode: str = "lora",
+        prefix_gradient_checkpointing: bool = True,
+        fsdp_branch_groups: bool = False,
+    ) -> None:
         super().__init__()
         self.pipe = pipe
         self.training_mode = training_mode
         self.prefix_gradient_checkpointing = prefix_gradient_checkpointing
+        self.fsdp_branch_groups = fsdp_branch_groups
         self.conditioning_cache: ConditioningResolver | None = None
         self.conditioning_reuse_disabled = False
         self.conditioning_reuse_disabled_reason: str | None = None
-        if training_mode == "full":
+        if training_mode == "full" and not fsdp_branch_groups:
             self._mark_fine_grained_modules()
 
     def _mark_fine_grained_modules(self) -> None:
@@ -404,12 +411,19 @@ class SenseNovaSFTAdapter:
             pipe,
             training_mode=mode,
             prefix_gradient_checkpointing=config.get("prefix_gradient_checkpointing", True),
+            fsdp_branch_groups=config.get("fsdp_branch_groups", False),
         )
 
     def prepare_for_sharding(self, model: SenseNovaSFTModel) -> None:
+        if model.fsdp_branch_groups and not model.conditioning_is_frozen():
+            # Prefix K/V are intermediate branch outputs. A sibling group's
+            # pre-backward hook on its final MLP output does not cover those
+            # edges when the prefix is trainable. Keep the ordinary decoder
+            # boundary for full/custom understanding training.
+            raise ValueError("fsdp_branch_groups requires a frozen understanding branch; disable it to train prefix")
         # Match the reference BF16 adapter initialization before FP32 masters.
         model.pipe.to(dtype=torch.bfloat16)
-        if model.training_mode == "lora":
+        if model.training_mode == "lora" or model.fsdp_branch_groups:
             dit = model.pipe.dit
             # These modules are invoked through __call__, so independent FSDP
             # boundaries load vision/text weights only on online encoding.
@@ -417,6 +431,30 @@ class SenseNovaSFTAdapter:
             # Apply this policy equally to online and cached LoRA training.
             for module in (dit.vision_model, dit.language_model.model.embed_tokens, dit.language_model.lm_head):
                 module._fsdp_fine_grained = True
+        if model.fsdp_branch_groups:
+            groups = []
+            for layer in model.pipe.dit.language_model.model.layers:
+                attention = layer.self_attn
+                for suffix in ("", "_mot_gen"):
+                    # Every member is invoked on its branch, ending with MLP;
+                    # grouped FSDP therefore reshards after the whole branch.
+                    # Keep generation PEFT wrappers intact so their base and
+                    # LoRA tensors have one owner. The understanding group is
+                    # only used under no_grad, as checked before sharding.
+                    groups.append(
+                        (
+                            getattr(layer, f"input_layernorm{suffix}"),
+                            *(getattr(attention, f"{name}{suffix}") for name in ("q_proj", "k_proj", "v_proj")),
+                            *(
+                                getattr(attention, f"{name}{suffix}")
+                                for name in ("q_norm", "q_norm_hw", "k_norm", "k_norm_hw")
+                            ),
+                            getattr(attention, f"o_proj{suffix}"),
+                            getattr(layer, f"post_attention_layernorm{suffix}"),
+                            getattr(layer, f"mlp{suffix}"),
+                        )
+                    )
+            model._fsdp_module_groups = tuple(groups)
 
     def on_device_ready(self, model: SenseNovaSFTModel, device: torch.device) -> None:
         # Never move the already sharded parameters through Module.to().
