@@ -460,6 +460,197 @@ def test_force_online_populates_cache_without_skip(runtime_factory):
     assert len(calls) == 2
 
 
+def test_prefetched_lease_avoids_second_lookup_and_keeps_exact_dtype(runtime_factory, monkeypatch):
+    monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "2")
+    runtime, _, _ = runtime_factory()
+    expected = torch.arange(8, dtype=torch.bfloat16)
+    runtime.resolve(_spec(), lambda: {"value": expected}, _restore)
+    runtime.begin_step()
+    lookup, calls = runtime.cache.lookup, []
+
+    def tracked_lookup(key, **kwargs):
+        calls.append(kwargs)
+        return lookup(key, **kwargs)
+
+    monkeypatch.setattr(runtime.cache, "lookup", tracked_lookup)
+    assert runtime.prefetch_many([_spec()]) == 1
+    actual = runtime.resolve(_spec(), lambda: pytest.fail("Warm prefetch must skip encoding"), _restore)["condition"]
+    assert len(calls) == 1 and "max_bytes" in calls[0]
+    assert actual.dtype == expected.dtype
+    assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    assert runtime._step["prefetch_hit"] == runtime._step["effective_hit"] == 1
+    assert runtime._step["encoding_calls"] == 0
+    assert runtime._prefetch.stats()["bytes"] == 0
+    runtime.close(0)
+    assert torch.equal(actual, expected), "The model must own its copy after the mmap/cache are closed"
+
+
+@pytest.mark.parametrize("guard", ["force_online", "_cache_guard_disabled"])
+def test_reference_or_invalidated_encoder_never_consumes_prefetched_features(runtime_factory, monkeypatch, guard):
+    monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "1")
+    runtime, _, _ = runtime_factory()
+    runtime.resolve(_spec(), lambda: {"value": torch.ones(4)}, _restore)
+    assert runtime.prefetch(_spec())
+    runtime._prefetch._pool.submit(lambda: None).result(timeout=5)
+    runtime.begin_step()
+    setattr(runtime, guard, True)
+    actual = runtime.resolve(_spec(), lambda: {"value": torch.full((4,), 2.0)}, _restore)
+    assert torch.equal(actual["condition"], torch.full((4,), 2.0))
+    assert runtime._step["prefetch_hit"] == runtime._step["effective_hit"] == 0
+    assert runtime._step["encoding_calls"] == 1
+    assert runtime._prefetch.stats()["bytes"] == 0
+
+
+def test_prefetch_rekeys_actual_effective_input_before_using_a_future(runtime_factory, monkeypatch):
+    monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "1")
+    runtime, _, _ = runtime_factory()
+    runtime.resolve(_spec(), lambda: {"value": torch.ones(2)}, _restore)
+    assert runtime.prefetch(_spec())
+    changed = ConditioningSpec("dummy.condition.v1", {"input": "changed-after-prefetch", "dtype": "bf16"}, True)
+    runtime.begin_step()
+    actual = runtime.resolve(changed, lambda: {"value": torch.full((2,), 3.0)}, _restore)
+    assert torch.equal(actual["condition"], torch.full((2,), 3.0))
+    assert runtime._step["prefetch_hit"] == 0 and runtime._step["encoding_calls"] == 1
+    runtime.prefetch_many([])
+    runtime._prefetch._pool.submit(lambda: None).result(timeout=5)
+    assert runtime._prefetch.stats()["bytes"] == 0
+
+
+def test_file_corrupted_after_prefetch_is_checked_again_before_use(runtime_factory, monkeypatch):
+    monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "1")
+    runtime, _, _ = runtime_factory()
+    expected = torch.arange(8, dtype=torch.bfloat16)
+    runtime.resolve(_spec(), lambda: {"value": expected}, _restore)
+    assert runtime.prefetch(_spec())
+    runtime._prefetch._pool.submit(lambda: None).result(timeout=5)
+    path = next(runtime.cache.directory.glob("*.safetensors"))
+    with path.open("r+b") as file:
+        file.seek(-1, 2)
+        original = file.read(1)
+        file.seek(-1, 2)
+        file.write(bytes([original[0] ^ 255]))
+    runtime.begin_step()
+    actual = runtime.resolve(_spec(), lambda: {"value": expected.clone()}, _restore)
+    assert torch.equal(actual["condition"], expected)
+    assert runtime._prefetch.stats()["stale"] == 1
+    assert runtime._step["prefetch_hit"] == 0 and runtime._step["encoding_calls"] == 1
+
+
+def test_prefetched_schema_failure_releases_budget_and_rebuilds_online(runtime_factory, monkeypatch):
+    monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "1")
+    runtime, _, _ = runtime_factory()
+    key = runtime._conditioning_key(_spec())
+    assert runtime.cache.put(key, {"wrong_field": torch.ones(2)})
+    assert runtime.prefetch(_spec())
+    expected = torch.arange(2, dtype=torch.bfloat16)
+    actual = runtime.resolve(_spec(), lambda: {"value": expected.clone()}, _restore)
+    assert torch.equal(actual["condition"], expected)
+    assert runtime._step["cache_errors"] == 1
+    assert runtime._step["effective_hit"] == 0 and runtime._step["encoding_calls"] == 1
+    assert runtime._prefetch.stats()["bytes"] == 0
+    with runtime.cache.lookup(key) as lease:
+        assert set(lease.data) == {"value"}
+
+
+def test_prefetch_disabled_with_online_runtime_and_close_drains_reader(runtime_factory, monkeypatch):
+    monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "2")
+    online, _, _ = runtime_factory(enabled=False)
+    assert not online.prefetch_enabled
+    assert online.prefetch_many([_spec()]) == 0
+    runtime, _, directory = runtime_factory(telemetry=True)
+    runtime.resolve(_spec(), lambda: {"value": torch.ones(2)}, _restore)
+    assert runtime.prefetch(_spec())
+    runtime.close(0, status="cancelled")
+    stats = runtime._prefetch.stats()
+    assert stats["closed"] and stats["bytes"] == stats["outstanding"] == 0
+    events = [json.loads(line) for line in (directory / "events-rank0.jsonl").read_text().splitlines()]
+    assert events[0]["prefetch_depth"] == 2
+    assert events[-1]["prefetch_stats"]["bytes"] == 0
+
+
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("phase", ["prefetch", "cache"])
+def test_interrupted_runtime_close_is_retryable_and_emits_one_close_event(
+    runtime_factory, monkeypatch, error_type, phase
+):
+    monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "1")
+    runtime, model, directory = runtime_factory(telemetry=True)
+    runtime.resolve(_spec(), lambda: {"value": torch.ones(2)}, _restore)
+    assert runtime.prefetch(_spec())
+    resource = runtime._prefetch if phase == "prefetch" else runtime.cache
+    original_close, calls = resource.close, []
+
+    def interrupt_once():
+        calls.append(1)
+        if len(calls) == 1:
+            raise error_type("cleanup interrupted")
+        return original_close()
+
+    monkeypatch.setattr(resource, "close", interrupt_once)
+    with pytest.raises(error_type, match="cleanup interrupted"):
+        runtime.close(0, status="cancelled")
+    assert not runtime._closed and not runtime._writer.closed
+    assert model.conditioning_cache is runtime
+    event_path = directory / "events-rank0.jsonl"
+    assert not any(json.loads(line)["stage"] == "close" for line in event_path.read_text().splitlines())
+    runtime.close(0, status="cancelled")
+    runtime.close(0, status="cancelled")
+    events = [json.loads(line) for line in event_path.read_text().splitlines()]
+    assert len([event for event in events if event["stage"] == "close"]) == 1
+    assert runtime._closed and runtime._writer.closed
+    assert model.conditioning_cache is None
+    assert runtime._prefetch.stats()["drained"]
+    assert runtime._prefetch.stats()["bytes"] == runtime._prefetch.stats()["outstanding"] == 0
+
+
+def test_retrying_writer_close_does_not_duplicate_the_completed_close_event(runtime_factory):
+    runtime, _, directory = runtime_factory(telemetry=True)
+    original_writer = runtime._writer
+
+    class InterruptingWriter:
+        attempts = 0
+
+        def write(self, value):
+            return original_writer.write(value)
+
+        def close(self):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise KeyboardInterrupt("writer close interrupted")
+            original_writer.close()
+
+    runtime._writer = InterruptingWriter()
+    with pytest.raises(KeyboardInterrupt, match="writer close interrupted"):
+        runtime.close(0, status="cancelled")
+    assert not runtime._closed and runtime._close_event_written
+    runtime.close(0, status="cancelled")
+    events = [json.loads(line) for line in (directory / "events-rank0.jsonl").read_text().splitlines()]
+    assert len([event for event in events if event["stage"] == "close"]) == 1
+    assert runtime._closed and original_writer.closed
+
+
+def test_initialization_cleanup_does_not_mask_the_original_error(runtime_factory, monkeypatch, tmp_path):
+    from relax.engine.sft import conditioning_prefetch
+
+    monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "1")
+
+    class FailingCleanup:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def close(self):
+            raise RuntimeError("secondary cleanup failure")
+
+    def fail_write(self, event):
+        raise ValueError("original initialization failure")
+
+    monkeypatch.setattr(conditioning_prefetch, "ConditioningPrefetch", FailingCleanup)
+    monkeypatch.setattr(conditioning.ConditioningRuntime, "_write", fail_write)
+    with pytest.raises(ValueError, match="original initialization failure"):
+        runtime_factory(telemetry=True)
+    assert not list((tmp_path / "cache").rglob("client-*")), "Other resources must still be cleaned"
+
+
 def test_step_jsonl_is_complete_delta_counted_and_close_is_idempotent(runtime_factory, monkeypatch):
     runtime, model, directory = runtime_factory(telemetry=True)
     monkeypatch.setattr(runtime, "_resources", lambda **_kwargs: {"cpu_rss_bytes": None, "shm_used_bytes": None})

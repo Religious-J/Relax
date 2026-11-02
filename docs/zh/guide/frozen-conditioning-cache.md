@@ -45,6 +45,8 @@ bash scripts/entrypoint/ray-job.sh \
 | `RELAX_CONDITION_CACHE_RUN_DIR` | 未设置 | 写入 `events-rank*.jsonl` 的全新 worker 可见目录；设置该变量也会启用测量。脚本默认使用 `${SAVE_DIR}/${EXP_NAME}/metrics`。 |
 | `RELAX_CONDITION_VERIFY` | `0` | 对首个有效训练 batch 比较在线与缓存路径，要求启用缓存并设置 run 目录。应与吞吐测量分开运行。 |
 | `RELAX_CONDITION_VERIFY_RTOL` | `0.01` | loss、累积梯度及 FP32 参数更新量的相对误差阈值。脚本接受 `0` 到 `0.01`。 |
+| `RELAX_CONDITION_PREFETCH_DEPTH` | `0` | 预取未来条件的最大条目数；为 0 时关闭。对照脚本要求同时开启图像预取。 |
+| `RELAX_CONDITION_PREFETCH_MAX_BYTES` | `536870912` | 每 worker 的预取 lease 字节上限，包含正在查找的预留和消费中的借用。 |
 
 缓存关闭且未设置测量变量时，SFT 使用原有在线路径。启用缓存也会启用相关测量；`RELAX_CONDITION_PROFILE=0` 不会移除缓存所需的协调和统计。
 
@@ -81,6 +83,12 @@ Worker 按训练 attempt 和节点共享 namespace。正常结束、取消或进
 容量与 staging 预算作用于每个节点上的单个训练 namespace；并发训练任务的预算需要相加，不存在跨任务的全局内存配额。性能对照应避免其他任务争用同一节点资源。
 
 ## 适配层接口与分布式执行
+
+多个 writer 共用 staging 总预算，在短临界区内预留容量，锁外执行 CPU 搬运、序列化和写文件，再短锁原子发布。独立 owner 锁保护在途写入，恢复逻辑回收失效 writer 的临时文件和预留；关闭 client 会等待读写结束。
+
+可选条件预取将未来样本的文件读取和 SHA 校验与当前反向/更新重叠。它只借用图像队列中已经解码的样本，依赖准备仍在训练线程执行，实际 forward 重新构造内容键并检查冻结状态。单个后台 reader 的预算按完整文件字节限制，消费中的 lease 直到 GPU 复制完成才归还。它不建立 GPU 常驻缓存或额外 pinned pool，GPU 搬运仍在训练线程执行；更长的 lease 可能影响容量不足时的淘汰。
+
+消费预取结果前会检查文件身份、大小和时间戳，变化时回退同步查找；每次新查找仍做完整 SHA。退出先停止并等待后台 reader，再关闭缓存；后台工作和清理计入生命周期。`prefetch_hit` 统计实际消费数，`prefetch_stats` 单独报告后台读取、等待、丢弃和预算峰值，不能替代有效样本命中率。
 
 公共声明位于 [`relax/models/generative_sft.py`](../../../relax/models/generative_sft.py)。适配层提供 `ConditioningSpec(name, dependencies, cacheable)`，并在模型正常的 FSDP forward 边界内调用 `ConditioningResolver.resolve(spec, compute, restore)`。
 

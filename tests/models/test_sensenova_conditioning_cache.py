@@ -155,6 +155,18 @@ def tiny_conditioning_model(monkeypatch):
     return model, data
 
 
+def test_prefetch_spec_matches_effective_forward_key_without_rng_or_encoding(tiny_conditioning_model):
+    model, data = tiny_conditioning_model
+    model.pipe.check_resize_height_width = lambda height, width: (height, width)
+    before = torch.get_rng_state().clone()
+    spec = model.conditioning_prefetch_spec(data)
+    assert spec == model.conditioning_spec(data, {"height": 32, "width": 32}, enabled=True)
+    assert torch.equal(before, torch.get_rng_state())
+    assert model.pipe.prefix_calls == 0
+    data["prompt"] = "different caption"
+    assert model.conditioning_prefetch_spec(data).dependencies != spec.dependencies
+
+
 def test_lora_fsdp_conditioning_boundaries_follow_online_and_hit_module_calls(tiny_conditioning_model, monkeypatch):
     """Exercise the real wrap collector and hooks used by fully_shard.
 

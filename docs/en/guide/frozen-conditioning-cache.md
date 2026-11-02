@@ -45,6 +45,8 @@ These settings are read by the image SFT runtime. The recipe exports them to the
 | `RELAX_CONDITION_CACHE_RUN_DIR` | Unset | New worker-visible directory for `events-rank*.jsonl`. Setting it also enables measurement. The recipe defaults to `${SAVE_DIR}/${EXP_NAME}/metrics`. |
 | `RELAX_CONDITION_VERIFY` | `0` | Compare the first effective training batch through online and cached paths. Requires caching and a run directory. Use a separate run from throughput measurement. |
 | `RELAX_CONDITION_VERIFY_RTOL` | `0.01` | Relative tolerance for loss, accumulated gradients, and FP32 parameter updates in the comparison. The recipe accepts values from `0` to `0.01`. |
+| `RELAX_CONDITION_PREFETCH_DEPTH` | `0` | Maximum future conditioning entries to prefetch; zero disables it. The recipe also requires image prefetch. |
+| `RELAX_CONDITION_PREFETCH_MAX_BYTES` | `536870912` | Per-worker lease budget, including in-flight lookup reservations and consumer borrows. |
 
 With all measurement settings unset and caching off, SFT uses its original online path. Enabling the cache also attaches its measurements; `RELAX_CONDITION_PROFILE=0` does not remove cache coordination or accounting.
 
@@ -81,6 +83,12 @@ Workers share a namespace for one training attempt and node. Each worker closes 
 Payload and staging budgets apply to one training namespace on each node. Concurrent jobs require the sum of their budgets; there is no global memory quota across jobs. Avoid unrelated node contention during performance comparisons.
 
 ## Adapter contract and distributed execution
+
+Concurrent writers share the staging budget. Each reserves capacity in a short critical section, performs CPU copies, serialization and file writes outside the namespace lock, then publishes atomically under the lock. Independent owner locks protect in-flight writes. Recovery removes abandoned temporary files and reservations; client close waits for active operations.
+
+Optional conditioning prefetch overlaps future file lookup and SHA verification with the current backward/update. It uses already decoded samples from the image queue; dependency preparation stays on the training thread. Actual forward rebuilds the content key and checks frozen state. One background reader charges complete file bytes until the consumer finishes its device copy. This extends shared mmap leases, without persistent GPU features or a pinned pool; device copies remain on the training thread. Longer leases can affect eviction under capacity pressure.
+
+Consumption checks file identity, size and timestamps and falls back to synchronous lookup on changes; every new lookup still verifies the complete SHA. Close drains the reader before closing storage, including that work in lifecycle timing. `prefetch_hit` counts consumed results; `prefetch_stats` separately reports background reads, waits, discards and budget peaks. Speculative reads are not effective sample hits.
 
 The public declarations are in [`relax/models/generative_sft.py`](../../../relax/models/generative_sft.py). An adapter supplies a `ConditioningSpec(name, dependencies, cacheable)` and calls `ConditioningResolver.resolve(spec, compute, restore)` inside the model's normal FSDP forward boundary.
 

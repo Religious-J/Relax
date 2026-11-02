@@ -246,6 +246,17 @@ class SenseNovaSFTModel(torch.nn.Module):
             }
         return ConditioningSpec("sensenova.prefix.v2", dependencies, cacheable)
 
+    def conditioning_prefetch_spec(self, data: dict[str, Any]) -> ConditioningSpec:
+        """Describe an already decoded sample without encoding or using RNG.
+
+        The trainer calls this outside FSDP forward, on its main thread.
+        Forward still prepares and keys its actual input independently; this
+        hint never authorizes reuse by sample ID or by the prefetched data's
+        identity.
+        """
+        height, width = self.pipe.check_resize_height_width(data["image"].height, data["image"].width)
+        return self.conditioning_spec(data, {"height": height, "width": width}, enabled=True)
+
     @staticmethod
     def _export_conditioning(positive: dict[str, Any], *, detach: bool) -> dict[str, torch.Tensor]:
         features = {"indexes_image": positive["indexes_image"]}

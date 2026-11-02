@@ -42,6 +42,8 @@ export RELAX_CONDITION_VERIFY_RTOL="${RELAX_CONDITION_VERIFY_RTOL:-0.01}"
 export RELAX_CONDITION_CACHE_MAX_BYTES="${RELAX_CONDITION_CACHE_MAX_BYTES:-8589934592}"
 export RELAX_CONDITION_CACHE_DIR="${RELAX_CONDITION_CACHE_DIR:-}"
 export RELAX_CONDITION_CACHE_RUN_DIR="${RELAX_CONDITION_CACHE_RUN_DIR:-${SAVE_DIR}/${EXP_NAME}/metrics}"
+export RELAX_CONDITION_PREFETCH_DEPTH="${RELAX_CONDITION_PREFETCH_DEPTH:-0}"
+export RELAX_CONDITION_PREFETCH_MAX_BYTES="${RELAX_CONDITION_PREFETCH_MAX_BYTES:-536870912}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 GPUS="${GPUS:-8}"
 GPUS_PER_NODE="${GPUS_PER_NODE:-$GPUS}"
@@ -70,7 +72,7 @@ positive = ("DATASET_SIZE", "GPUS", "GPUS_PER_NODE", "STEPS", "MAX_PIXELS", "CON
 for name in positive:
     if not os.environ[name].isdecimal() or int(os.environ[name]) <= 0:
         raise SystemExit(f"{name} must be a positive integer")
-for name in ("RELAX_CONDITION_CACHE_MAX_BYTES", "IMAGE_PREFETCH_DEPTH"):
+for name in ("RELAX_CONDITION_CACHE_MAX_BYTES", "IMAGE_PREFETCH_DEPTH", "RELAX_CONDITION_PREFETCH_DEPTH", "RELAX_CONDITION_PREFETCH_MAX_BYTES"):
     if not os.environ[name].isdecimal():
         raise SystemExit(f"{name} must be a nonnegative integer")
 gpus, per_node = int(os.environ["GPUS"]), int(os.environ["GPUS_PER_NODE"])
@@ -78,6 +80,11 @@ if 8 % gpus or gpus % per_node:
     raise SystemExit("GPUS must divide the fixed effective batch 8 and be divisible by GPUS_PER_NODE")
 if os.environ["RELAX_CONDITION_CACHE"] == "1" and int(os.environ["RELAX_CONDITION_CACHE_MAX_BYTES"]) == 0:
     raise SystemExit("An enabled cache requires a positive byte budget")
+if int(os.environ["RELAX_CONDITION_PREFETCH_DEPTH"]) > 0:
+    if int(os.environ["RELAX_CONDITION_PREFETCH_MAX_BYTES"]) == 0:
+        raise SystemExit("Conditioning prefetch requires a positive byte budget")
+    if int(os.environ["IMAGE_PREFETCH_DEPTH"]) == 0:
+        raise SystemExit("Conditioning prefetch requires IMAGE_PREFETCH_DEPTH > 0")
 if int(os.environ["CONDITIONING_IMAGES"]) not in (1, 2):
     raise SystemExit("CONDITIONING_IMAGES must be 1 or 2")
 try:
@@ -108,7 +115,7 @@ env = runtime.setdefault("env_vars", {})
 env.setdefault("PATH", os.environ["PATH"])
 for key in ("RELAX_CONDITION_CACHE", "RELAX_CONDITION_PROFILE", "RELAX_CONDITION_CACHE_MAX_BYTES",
             "RELAX_CONDITION_CACHE_DIR", "RELAX_CONDITION_CACHE_RUN_DIR", "RELAX_CONDITION_VERIFY",
-            "RELAX_CONDITION_VERIFY_RTOL"):
+            "RELAX_CONDITION_VERIFY_RTOL", "RELAX_CONDITION_PREFETCH_DEPTH", "RELAX_CONDITION_PREFETCH_MAX_BYTES"):
     env[key] = os.environ[key]
 print(json.dumps(runtime))
 PY

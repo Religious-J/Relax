@@ -201,7 +201,10 @@ class FSDPSFTTrainer:
                     trainer_started=trainer_started,
                 )
             except BaseException:
-                self.close()
+                try:
+                    self.close()
+                except BaseException as cleanup_error:
+                    logger.warning("SFT initialization cleanup interrupted: %s", cleanup_error)
                 raise
 
     def _resume(self) -> None:
@@ -232,7 +235,10 @@ class FSDPSFTTrainer:
             self._train_step(step)
         except BaseException:
             self._close_status = "error"
-            self.close()
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                logger.warning("SFT error cleanup interrupted: %s", cleanup_error)
             raise
 
     def close(self) -> None:
@@ -241,6 +247,21 @@ class FSDPSFTTrainer:
         runtime = getattr(self, "conditioning", None)
         if runtime is not None:
             runtime.close(self.step, status=getattr(self, "_close_status", None))
+
+    def _prefetch_conditioning(self) -> None:
+        runtime = getattr(self, "conditioning", None)
+        describe = getattr(self.actor.model, "conditioning_prefetch_spec", None)
+        if self.prefetch is None or runtime is None or not runtime.prefetch_enabled or describe is None:
+            return
+        try:
+            # CPU decoding has already happened in the original image queue.
+            # Only the training thread reads model/tokenizer state. The cache
+            # executor receives content keys and never runs model collectives.
+            specs = [describe(data) for _, _, _, data in self.prefetch.ready_samples(runtime.prefetch_depth)]
+            runtime.prefetch_many(specs)
+        except Exception as error:
+            runtime.prefetch_many([])
+            logger.warning("Conditioning lookahead skipped; retaining synchronous lookup: %s", error)
 
     def _train_step(self, step: int) -> None:
         from relax.backends.fsdp.actor import _collect_weight_sync_errors
@@ -299,6 +320,9 @@ class FSDPSFTTrainer:
                 prepared.append((sample_id, data))
                 continue
             loss = self.actor.model(data)
+            # The current resolver has consumed its entry. Replace the future
+            # window now, allowing lookup/checksum to overlap backward/update.
+            self._prefetch_conditioning()
             torch._assert_async(torch.isfinite(loss), "Non-finite SFT loss")
             (loss / len(ids)).backward()
             loss_sum.add_(loss.detach().float() / len(ids))
@@ -308,6 +332,11 @@ class FSDPSFTTrainer:
 
             def forward(sample):
                 runtime.sample(sample[0])
+                describe = getattr(self.actor.model, "conditioning_prefetch_spec", None)
+                if runtime.prefetch_enabled and not runtime.force_online and describe is not None:
+                    # Exercise the actual read-ahead consumer in the numerical
+                    # comparison too. Reference encoding remains independent.
+                    runtime.prefetch_many([describe(sample[1])])
                 return self.actor.model(sample[1])
 
             report = verify_update(
@@ -387,7 +416,10 @@ class FSDPSFTTrainer:
             self._save_checkpoint()
         except BaseException:
             self._close_status = "error"
-            self.close()
+            try:
+                self.close()
+            except BaseException as cleanup_error:
+                logger.warning("SFT checkpoint cleanup interrupted: %s", cleanup_error)
             raise
 
     def _save_checkpoint(self) -> None:

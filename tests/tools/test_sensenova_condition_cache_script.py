@@ -70,6 +70,26 @@ def test_smaller_gpu_count_preserves_effective_batch_and_explicit_nowait(tmp_pat
     assert args[args.index("--actor-num-gpus-per-node") + 1] == "2"
 
 
+def test_condition_prefetch_controls_reach_ray_workers(tmp_path):
+    result = preview(
+        tmp_path,
+        IMAGE_PREFETCH_DEPTH="4",
+        RELAX_CONDITION_PREFETCH_DEPTH="2",
+        RELAX_CONDITION_PREFETCH_MAX_BYTES="536870912",
+    )
+    assert result.returncode == 0, result.stderr
+    args = json.loads(result.stdout)
+    env = json.loads(args[args.index("--runtime-env-json") + 1])["env_vars"]
+    assert env["RELAX_CONDITION_PREFETCH_DEPTH"] == "2"
+    assert env["RELAX_CONDITION_PREFETCH_MAX_BYTES"] == "536870912"
+
+
+@pytest.mark.parametrize("overrides", [{"IMAGE_PREFETCH_DEPTH": "0"}, {"RELAX_CONDITION_PREFETCH_MAX_BYTES": "0"}])
+def test_condition_prefetch_requires_decoded_lookahead_and_capacity(tmp_path, overrides):
+    result = preview(tmp_path, **({"IMAGE_PREFETCH_DEPTH": "4", "RELAX_CONDITION_PREFETCH_DEPTH": "2"} | overrides))
+    assert result.returncode != 0
+
+
 def test_verify_flags_propagate_and_perf_can_disable_checkpoints(tmp_path):
     result = preview(tmp_path, RELAX_CONDITION_VERIFY="1", RELAX_CONDITION_VERIFY_RTOL="0", SAVE_CHECKPOINTS="0")
     assert result.returncode == 0, result.stderr

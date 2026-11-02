@@ -5,8 +5,12 @@ import hashlib
 import json
 import multiprocessing
 import os
+import shutil
 import struct
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from queue import Queue
 
 import pytest
 
@@ -281,7 +285,7 @@ def test_partial_writes_release_reservations(tmp_path: Path, monkeypatch, error_
     original = Path.write_bytes
 
     def fail_payload(path: Path, data: bytes) -> int:
-        if path.name == "payload.pending":
+        if path.name.startswith("writer-") and path.suffix == ".pending" and ".json." not in path.name:
             original(path, data[: len(data) // 2])
             raise error_type("interrupted write")
         return original(path, data)
@@ -655,3 +659,410 @@ def test_failed_transfer_keeps_source_until_lease_close(tmp_path: Path, monkeypa
                 lease.copy_to("cpu")
             assert len(lease._transfer_sources) == 1
         assert not lease._transfer_sources
+
+
+def _abandoned_inflight_writer(directory: str) -> None:
+    original = Path.write_bytes
+
+    def die_during_payload(path: Path, content: bytes) -> int:
+        if path.name.startswith("writer-") and path.suffix == ".pending":
+            original(path, content[: len(content) // 2])
+            os._exit(0)
+        return original(path, content)
+
+    Path.write_bytes = die_during_payload
+    cache = _cache(1 << 20, directory, "shared")
+    cache.put("unfinished", _payload())
+    os._exit(3)
+
+
+def test_writers_copy_and_serialize_concurrently_while_lookup_proceeds(tmp_path: Path, monkeypatch) -> None:
+    import safetensors.torch
+
+    entered, release = Queue(), threading.Event()
+    original = safetensors.torch.save
+
+    def delayed_save(*args, **kwargs):
+        entered.put(True)
+        if not release.wait(15):
+            raise RuntimeError("Timed out waiting for concurrent serialization")
+        return original(*args, **kwargs)
+
+    with _cache(1 << 20, tmp_path, "parallel-threads") as cache:
+        assert cache.put("existing", _payload())
+        with ThreadPoolExecutor(max_workers=2) as pool, monkeypatch.context() as patch:
+            patch.setattr(safetensors.torch, "save", delayed_save)
+            futures = [pool.submit(cache.put, key, _payload()) for key in ("a", "b")]
+            try:
+                assert entered.get(timeout=10) and entered.get(timeout=10)
+                # Both writes are live, yet neither holds the namespace lock
+                # nor prevents this same client's lookup from making progress.
+                state = cache.stats()
+                assert state["inflight_writes"] == 2
+                assert 0 < state["staging_reserved_bytes"] <= state["max_staging_bytes"]
+                assert state["bytes_reserved"] == 0  # No file write started yet.
+                with cache.lookup("existing") as lease:
+                    _assert_exact(lease.data, _payload())
+            finally:
+                release.set()
+            assert all(future.result(timeout=15) for future in futures)
+        state = cache.stats()
+        assert state["inflight_writes"] == state["staging_reserved_bytes"] == state["bytes_reserved"] == 0
+        assert state["entries"] == 3
+        assert not list(cache.directory.glob("writer-*"))
+        assert all(
+            state[key] > 0 for key in ("serialize_seconds", "file_write_seconds", "checksum_seconds", "map_seconds")
+        )
+
+
+def test_concurrent_payload_reservations_never_overcommit_disk_budget(tmp_path: Path, monkeypatch) -> None:
+    import safetensors.torch
+
+    size = _entry_size(tmp_path, _payload())
+    barrier, writing, release = threading.Barrier(2), threading.Event(), threading.Event()
+    original_save, original_write = safetensors.torch.save, Path.write_bytes
+
+    def simultaneous_save(*args, **kwargs):
+        value = original_save(*args, **kwargs)
+        barrier.wait(timeout=10)
+        return value
+
+    def delayed_write(path: Path, content: bytes) -> int:
+        result = original_write(path, content)
+        if path.name.startswith("writer-") and path.suffix == ".pending":
+            writing.set()
+            if not release.wait(15):
+                raise RuntimeError("Timed out waiting with reserved payload")
+        return result
+
+    with _cache(size, tmp_path, "payload-reservations") as cache:
+        with ThreadPoolExecutor(max_workers=2) as pool, monkeypatch.context() as patch:
+            patch.setattr(safetensors.torch, "save", simultaneous_save)
+            patch.setattr(Path, "write_bytes", delayed_write)
+            futures = [pool.submit(cache.put, key, _payload()) for key in ("a", "b")]
+            try:
+                assert writing.wait(10)
+                state = cache.stats()
+                assert state["resident_bytes"] + state["bytes_reserved"] <= size
+                assert state["bytes_reserved"] == size
+                assert sum(path.stat().st_size for path in cache.directory.glob("writer-*.pending")) == size
+            finally:
+                release.set()
+            assert sorted(future.result(timeout=15) for future in futures) == [False, True]
+        assert cache.stats()["resident_bytes"] == size
+        assert cache.stats()["inflight_writes"] == 0
+
+
+def test_live_writer_survives_index_recovery_and_keeps_staging_charged(tmp_path: Path, monkeypatch) -> None:
+    import safetensors.torch
+
+    entered, release = threading.Event(), threading.Event()
+    original = safetensors.torch.save
+    with _cache(1 << 20, tmp_path, "measure-staging") as measured:
+        assert measured.put("item", _payload())
+        required_staging = measured.stats()["peak_staging_reserved_bytes"]
+
+    def delayed_save(*args, **kwargs):
+        entered.set()
+        if not release.wait(15):
+            raise RuntimeError("Timed out waiting during index recovery")
+        return original(*args, **kwargs)
+
+    # This allows one serialization reservation but cannot fit two.
+    with ConditioningCache(1 << 20, tmp_path, "recover-writer", max_staging_bytes=required_staging) as cache:
+        with ThreadPoolExecutor(max_workers=1) as pool, monkeypatch.context() as patch:
+            patch.setattr(safetensors.torch, "save", delayed_save)
+            future = pool.submit(cache.put, "item", _payload())
+            try:
+                assert entered.wait(10)
+                before = cache.stats()["staging_reserved_bytes"]
+                assert before == required_staging > 0
+                with cache._locked():
+                    (cache.directory / "index.json").write_text("damaged index")
+                recovered = cache.stats()
+                assert recovered["inflight_writes"] == 1
+                assert recovered["staging_reserved_bytes"] == before
+                assert not cache.put("item", _payload())  # Same key has an active owner.
+                assert not cache.put("other", _payload())  # Aggregate staging remains billed.
+            finally:
+                release.set()
+            assert future.result(timeout=15)
+        with cache.lookup("item") as lease:
+            _assert_exact(lease.data, _payload())
+
+
+@pytest.mark.parametrize("operation", ["clear", "invalidate"])
+def test_invalidation_cancels_pending_publication(tmp_path: Path, monkeypatch, operation: str) -> None:
+    import safetensors.torch
+
+    entered, release = threading.Event(), threading.Event()
+    original = safetensors.torch.save
+
+    def delayed_save(*args, **kwargs):
+        entered.set()
+        if not release.wait(15):
+            raise RuntimeError("Timed out waiting for invalidation")
+        return original(*args, **kwargs)
+
+    with _cache(1 << 20, tmp_path, "cancel-writer") as cache:
+        with ThreadPoolExecutor(max_workers=1) as pool, monkeypatch.context() as patch:
+            patch.setattr(safetensors.torch, "save", delayed_save)
+            future = pool.submit(cache.put, "item", _payload())
+            try:
+                assert entered.wait(10)
+                if operation == "clear":
+                    assert not cache.clear()  # Writer still owns temporary buffers.
+                else:
+                    assert cache.invalidate("item")
+            finally:
+                release.set()
+            assert not future.result(timeout=15)
+        assert cache.lookup("item") is None
+        assert cache.stats()["inflight_writes"] == 0
+        assert not list(cache.directory.glob("writer-*"))
+
+
+def test_close_waits_for_active_writer_and_rejects_new_operations(tmp_path: Path, monkeypatch) -> None:
+    import safetensors.torch
+
+    entered, release, closing = threading.Event(), threading.Event(), threading.Event()
+    original = safetensors.torch.save
+    cache = _cache(1 << 20, tmp_path, "close-writer")
+
+    def delayed_save(*args, **kwargs):
+        entered.set()
+        if not release.wait(15):
+            raise RuntimeError("Timed out waiting for close")
+        return original(*args, **kwargs)
+
+    def close():
+        closing.set()
+        cache.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool, monkeypatch.context() as patch:
+            patch.setattr(safetensors.torch, "save", delayed_save)
+            writer = pool.submit(cache.put, "item", _payload())
+            try:
+                assert entered.wait(10)
+                closer = pool.submit(close)
+                assert closing.wait(10)
+                # Wait on lifecycle state rather than scheduling-dependent sleep.
+                with cache._lifecycle:
+                    cache._lifecycle.wait_for(lambda: cache._closing, timeout=5)
+                    assert cache._closing and not cache._closed
+                assert not closer.done()
+                assert cache.lookup("item") is None
+                assert not cache.put("other", _payload())
+                assert cache.directory.exists()
+            finally:
+                release.set()
+            assert writer.result(timeout=15)
+            closer.result(timeout=15)
+        assert cache._closed and not cache.directory.exists()
+    finally:
+        cache.close()
+
+
+def test_dead_writer_partial_file_and_reservations_are_reclaimed(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    with _cache(1 << 20, tmp_path, "shared") as cache:
+        assert cache.put("kept", _payload())
+        worker = context.Process(target=_abandoned_inflight_writer, args=(str(tmp_path),))
+        worker.start()
+        worker.join(timeout=30)
+        if worker.is_alive():
+            worker.kill()
+            worker.join()
+        assert worker.exitcode == 0
+        assert list(cache.directory.glob("writer-*.pending"))
+        state = cache.stats()
+        assert state["inflight_writes"] == state["bytes_reserved"] == state["staging_reserved_bytes"] == 0
+        assert not list(cache.directory.glob("writer-*"))
+        with cache.lookup("kept") as lease:
+            _assert_exact(lease.data, _payload())
+        assert cache.put("unfinished", _payload())
+
+
+def test_lookup_byte_budget_is_checked_before_checksum_and_borrow(tmp_path: Path, monkeypatch) -> None:
+    import relax.utils.conditioning_cache as module
+
+    with _cache(1 << 20, tmp_path, "lookup-budget") as cache:
+        assert cache.put("item", _payload())
+        size = cache.stats()["resident_bytes"]
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                module, "fingerprint_file", lambda _: pytest.fail("Oversized prefetch must not read payload")
+            )
+            assert cache.lookup("item", max_bytes=size - 1) is None
+        with cache.lookup("item", max_bytes=size) as lease:
+            assert lease.nbytes == size and lease.is_unchanged()
+        assert not lease.is_unchanged()
+        assert cache.stats()["corruptions"] == 0
+
+
+@pytest.mark.parametrize("mutation", ["rewrite", "replace", "unlink"])
+def test_delayed_lease_detects_payload_changes(tmp_path: Path, mutation: str) -> None:
+    with _cache(1 << 20, tmp_path, "delayed-identity") as cache:
+        assert cache.put("item", _payload())
+        with cache.lookup("item") as lease:
+            path = Path(lease._descriptor.name)
+            if mutation == "rewrite":
+                with path.open("r+b") as destination:
+                    destination.seek(-1, 2)
+                    destination.write(b"x")
+            elif mutation == "replace":
+                replacement = path.with_suffix(".replacement")
+                replacement.write_bytes(path.read_bytes())
+                os.replace(replacement, path)
+            else:
+                path.unlink()
+            assert not lease.is_unchanged()
+
+
+def _hold_writer_serialization(directory: str, entered, release, queue) -> None:
+    import safetensors.torch
+
+    original = safetensors.torch.save
+
+    def hold(*args, **kwargs):
+        entered.set()
+        if not release.wait(20):
+            raise RuntimeError("Timed out waiting to release spawned writer")
+        return original(*args, **kwargs)
+
+    safetensors.torch.save = hold
+    try:
+        with _cache(1 << 20, directory, "shared") as cache:
+            queue.put(cache.put("child", _payload()))
+    except BaseException as error:
+        queue.put(repr(error))
+
+
+def test_spawned_serializing_writer_does_not_block_peer_reads_or_writes(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    entered, release, queue = context.Event(), context.Event(), context.Queue()
+    with _cache(1 << 20, tmp_path, "shared") as cache:
+        assert cache.put("kept", _payload())
+        worker = context.Process(target=_hold_writer_serialization, args=(str(tmp_path), entered, release, queue))
+        worker.start()
+        try:
+            assert entered.wait(30)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+
+                def probe():
+                    with cache.lookup("kept") as lease:
+                        _assert_exact(lease.data, _payload())
+                    return cache.put("parent", _payload())
+
+                future = pool.submit(probe)
+                try:
+                    assert future.result(timeout=5)
+                    assert cache.stats()["inflight_writes"] == 1
+                finally:
+                    release.set()
+            assert queue.get(timeout=30) is True
+        finally:
+            release.set()
+            worker.join(timeout=15)
+            if worker.is_alive():
+                worker.kill()
+                worker.join()
+        assert worker.exitcode == 0
+        assert cache.stats()["entries"] == 3
+
+
+def test_interrupted_close_can_be_retried_without_deadlocking(tmp_path: Path, monkeypatch) -> None:
+    cache = _cache(1 << 20, tmp_path, "interrupted-close")
+    try:
+        assert cache.put("item", _payload())
+        with monkeypatch.context() as patch:
+
+            def interrupt(*args, **kwargs):
+                raise KeyboardInterrupt("cancelled while waiting")
+
+            patch.setattr(cache._lifecycle, "wait_for", interrupt)
+            with pytest.raises(KeyboardInterrupt):
+                cache.close()
+        assert not cache._closing and not cache._closed
+        with cache.lookup("item") as lease:
+            _assert_exact(lease.data, _payload())
+    finally:
+        cache.close()
+    assert not cache.directory.exists()
+
+
+@pytest.mark.parametrize("error_type", [OSError, KeyboardInterrupt])
+@pytest.mark.parametrize(
+    "phase", ["lease", "client", "client_after_close", "unlink", "rmtree_partial", "rmtree_after", "lock_after_close"]
+)
+def test_cleanup_failure_keeps_close_retryable_and_releases_all_resources(
+    tmp_path: Path, monkeypatch, phase: str, error_type
+) -> None:
+    cache = _cache(1 << 20, tmp_path, "retry-cleanup")
+    assert cache.put("item", _payload())
+    lease = cache.lookup("item")
+    assert lease is not None
+    client, namespace_lock = cache._client_file, cache._lock_file
+    assert client is not None and namespace_lock is not None
+    failure = error_type(f"interrupted {phase} cleanup")
+    try:
+        with monkeypatch.context() as patch:
+            if phase == "lease":
+
+                def fail_lease():
+                    raise failure
+
+                patch.setattr(lease, "close", fail_lease)
+            elif phase in ("client", "client_after_close", "lock_after_close"):
+                handle = namespace_lock if phase == "lock_after_close" else client
+                original_close = handle.close
+
+                def fail_close():
+                    if phase != "client":
+                        original_close()
+                    raise failure
+
+                patch.setattr(handle, "close", fail_close)
+            elif phase == "unlink":
+                original_unlink = Path.unlink
+
+                def fail_unlink(path, *args, **kwargs):
+                    if path == cache._client_path:
+                        raise failure
+                    return original_unlink(path, *args, **kwargs)
+
+                patch.setattr(Path, "unlink", fail_unlink)
+            else:
+                original_rmtree = shutil.rmtree
+
+                def fail_rmtree(path, *args, **kwargs):
+                    if Path(path) == cache.directory:
+                        if phase == "rmtree_partial":
+                            (cache.directory / "index.json").unlink()
+                        else:
+                            original_rmtree(path, *args, **kwargs)
+                        raise failure
+                    return original_rmtree(path, *args, **kwargs)
+
+                patch.setattr(shutil, "rmtree", fail_rmtree)
+            with pytest.raises(error_type, match=f"interrupted {phase}") as caught:
+                cache.close()
+            assert caught.value is failure  # Preserve the original exception for the runtime.
+            assert not cache._closed and not cache._closing
+            assert cache._lock_file is namespace_lock
+            if phase in ("lease", "client"):
+                assert not client.closed
+            if phase == "unlink":
+                assert client.closed and cache._client_file is None
+                assert cache._client_path.exists()
+        cache.close()
+        assert cache._closed and not cache._closing
+        assert client.closed and namespace_lock.closed
+        assert cache._client_file is None and cache._lock_file is None
+        assert lease._descriptor is None and lease.data is None
+        assert not cache._leases
+        assert not cache.directory.exists()
+        cache.close()  # Successful cleanup is still idempotent.
+    finally:
+        cache.close()

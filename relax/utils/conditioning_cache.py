@@ -8,8 +8,9 @@ finish device copies before closing it and do not retain its CPU tensors later.
 Put snapshots its input; callers must not mutate that input during the call.
 
 The payload budget includes leased entries and temporary file reservations.
-A separate staging budget bounds the single writer's CPU tensor/serialization
-buffers before copying begins. JSON/client metadata is bounded by entries/live
+A separate staging budget bounds all writers' CPU tensor/serialization
+buffers before copying begins. Writers reserve bytes under the namespace lock,
+then copy and serialize independently. JSON/client metadata is bounded by entries/live
 workers and reported separately. The final client removes its namespace. One
 stable lock remains per directory, avoiding split locks on namespace recreation.
 After hard process termination, the next cache initialization reclaims abandoned
@@ -182,8 +183,34 @@ class ConditioningLease:
         self.data = data
         self._schema, self._tensors, self._metadata = schema, tensors, metadata
         self._file_size, self._file_header = self._read_header()
+        self._identity = self._stat_identity(os.fstat(descriptor.fileno()))
         self._copy_started = False
         self._transfer_sources: list[Any] = []
+
+    @property
+    def nbytes(self) -> int:
+        """Validated file bytes held by this lease, including its header."""
+        return self._file_size
+
+    @staticmethod
+    def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
+        return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+
+    def is_unchanged(self) -> bool:
+        """Reject ordinary mutations/replacements since the validated lookup.
+
+        This is a cheap guard for a delayed consumer, not a substitute for the
+        full checksum on every new file lookup. Cache files are immutable.
+        """
+        if self._descriptor is None:
+            return False
+        try:
+            return (
+                self._stat_identity(os.fstat(self._descriptor.fileno())) == self._identity
+                and self._stat_identity(os.stat(self._descriptor.name)) == self._identity
+            )
+        except OSError:
+            return False
 
     def _read_header(self) -> tuple[int, bytes]:
         descriptor = self._descriptor.fileno()
@@ -333,6 +360,11 @@ class ConditioningCache:
         self.max_staging_bytes = self.max_bytes if max_staging_bytes is None else int(max_staging_bytes)
         self.directory = Path(directory) / "relax-conditioning-v1" / build_key({"namespace": namespace})
         self._mutex = threading.RLock()
+        self._counter_lock = threading.Lock()
+        self._temporary_host_bytes = 0
+        self._lifecycle = threading.Condition(threading.RLock())
+        self._active_operations = 0
+        self._closing = False
         self._lock_file: Any = None
         self._client_file: Any = None
         self._client_path = self.directory / f"client-{uuid.uuid4().hex}"
@@ -358,6 +390,13 @@ class ConditioningCache:
                 "peak_staging_reserved_bytes",
                 "checksum_bytes",
                 "reclaimed_namespaces",
+                "lock_wait_seconds",
+                "lock_hold_seconds",
+                "checksum_seconds",
+                "map_seconds",
+                "d2h_seconds",
+                "serialize_seconds",
+                "file_write_seconds",
             ),
             0,
         )
@@ -387,12 +426,31 @@ class ConditioningCache:
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
+        started = time.perf_counter()
         with self._mutex:
             fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_EX)
+            acquired = time.perf_counter()
+            self._count("lock_wait_seconds", acquired - started)
             try:
                 yield
             finally:
+                self._count("lock_hold_seconds", time.perf_counter() - acquired)
                 fcntl.flock(self._lock_file.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def _operation(self) -> Iterator[bool]:
+        """Keep the client alive without serializing independent heavy I/O."""
+        with self._lifecycle:
+            active = not self._closing and not self._closed and self._client_file is not None
+            if active:
+                self._active_operations += 1
+        try:
+            yield active
+        finally:
+            if active:
+                with self._lifecycle:
+                    self._active_operations -= 1
+                    self._lifecycle.notify_all()
 
     @staticmethod
     def _empty_storage() -> dict[str, int]:
@@ -411,8 +469,19 @@ class ConditioningCache:
         )
 
     def _error(self, operation: str, error: Exception) -> None:
-        self._counters["errors"] += 1
+        self._count("errors", 1)
         logger.warning("Conditioning cache %s failed; using online encoding: %s", operation, error)
+
+    def _count(self, name: str, amount: int | float = 1) -> None:
+        with self._counter_lock:
+            self._counters[name] += amount
+
+    def _host_staging(self, amount: int) -> None:
+        with self._counter_lock:
+            self._temporary_host_bytes += amount
+            self._counters["peak_temporary_host_bytes"] = max(
+                self._counters["peak_temporary_host_bytes"], self._temporary_host_bytes
+            )
 
     def _reap_clients(self, directory: Path | None = None) -> int:
         live = 0
@@ -444,7 +513,7 @@ class ConditioningCache:
                 owner = json.loads((directory / "owner.json").read_text())
                 if owner != {"owner": _OWNER, "namespace": directory.name} or self._reap_clients(directory):
                     continue
-                for path in directory.glob("*.safetensors"):
+                for path in [*directory.glob("*.safetensors"), *directory.glob("writer-*.lock")]:
                     if path.is_symlink():
                         break
                     with path.open("rb") as descriptor:
@@ -454,7 +523,7 @@ class ConditioningCache:
                             break
                 else:
                     shutil.rmtree(directory)
-                    self._counters["reclaimed_namespaces"] += 1
+                    self._count("reclaimed_namespaces", 1)
             except FileNotFoundError:
                 continue
             except (OSError, ValueError, TypeError) as error:
@@ -468,6 +537,7 @@ class ConditioningCache:
             "entries": {},
             "reserved_bytes": 0,
             "staging_reserved_bytes": 0,
+            "writers": {},
         }
         try:
             loaded = json.loads((self.directory / "index.json").read_text())
@@ -475,6 +545,7 @@ class ConditioningCache:
                 not isinstance(loaded, dict)
                 or loaded.get("format") != _FORMAT
                 or not isinstance(loaded.get("entries"), dict)
+                or not isinstance(loaded.get("writers", {}), dict)
                 or not all(
                     type(loaded.get(field)) is int and loaded[field] >= 0
                     for field in ("max_bytes", "max_staging_bytes", "reserved_bytes", "staging_reserved_bytes")
@@ -483,21 +554,21 @@ class ConditioningCache:
             ):
                 raise ValueError("Invalid conditioning cache index")
             index = loaded
+            index.setdefault("writers", {})
         except FileNotFoundError:
             if not recover:
                 raise
         except (ValueError, KeyError, TypeError) as error:
-            self._counters["corruptions"] += 1
+            self._count("corruptions", 1)
             if not recover:
                 raise ValueError("Invalid conditioning cache index") from error
         if not recover:
             return index
-        # A writer holds this lock throughout publication. Pending files seen
-        # by another lock owner therefore belong to an exited writer.
+        # Legacy pending files and index updates still belong to an exited
+        # lock owner. New payloads belong to individually locked writers.
         for name in ("payload.pending", "index.pending"):
             (self.directory / name).unlink(missing_ok=True)
-        index["reserved_bytes"] = 0
-        index["staging_reserved_bytes"] = 0
+        self._recover_writers(index)
         entries = index["entries"]
         for key in list(entries):
             path = self.directory / f"{key}.safetensors"
@@ -509,23 +580,90 @@ class ConditioningCache:
             if not stat.S_ISREG(actual.st_mode):
                 path.unlink(missing_ok=True)
                 del entries[key]
-                self._counters["corruptions"] += 1
+                self._count("corruptions", 1)
             elif actual.st_size != entries[key]["size"]:
                 # A damaged index must never undercharge a still-borrowed
                 # payload. Invalid leased files remain billed at actual size.
                 entries[key].update(size=actual.st_size, invalid=True)
-                self._counters["corruptions"] += 1
+                self._count("corruptions", 1)
                 self._remove(key, index)
         for path in self.directory.glob("*.safetensors"):
             if path.stem not in entries:
                 actual = path.lstat()
                 if not stat.S_ISREG(actual.st_mode):
                     path.unlink(missing_ok=True)
-                    self._counters["corruptions"] += 1
+                    self._count("corruptions", 1)
                     continue
                 entries[path.stem] = {"size": actual.st_size, "access": 0, "sha256": "", "invalid": True}
                 self._remove(path.stem, index)
         return index
+
+    def _writer_state(self, identity: str, reservation: dict[str, Any]) -> None:
+        temporary = self.directory / f"writer-{identity}.json.pending"
+        try:
+            temporary.write_text(json.dumps(reservation, separators=(",", ":"), allow_nan=False))
+            os.replace(temporary, self.directory / f"writer-{identity}.json")
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    @staticmethod
+    def _account_writers(index: dict[str, Any]) -> None:
+        index["reserved_bytes"] = sum(writer["payload"] for writer in index["writers"].values())
+        index["staging_reserved_bytes"] = sum(writer["staging"] for writer in index["writers"].values())
+
+    def _recover_writers(self, index: dict[str, Any]) -> None:
+        """Reconstruct reservations from live writer locks, even after index
+        damage.
+
+        Called under the namespace lock. A live writer's sidecar is atomically
+        updated under this same lock before its reserved bytes may be used.
+        Unknown live metadata is an error, never an uncharged allocation.
+        """
+        writers = {}
+        for path in self.directory.glob("writer-*.lock"):
+            identity = path.stem.removeprefix("writer-")
+            if len(identity) != 32 or any(char not in "0123456789abcdef" for char in identity):
+                continue
+            with path.open("rb") as descriptor:
+                try:
+                    fcntl.flock(descriptor.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    reservation = json.loads((self.directory / f"writer-{identity}.json").read_text())
+                    if (
+                        not isinstance(reservation, dict)
+                        or not isinstance(reservation.get("key"), str)
+                        or len(reservation["key"]) != 64
+                        or any(char not in "0123456789abcdef" for char in reservation["key"])
+                        or not all(
+                            type(reservation.get(field)) is int and reservation[field] >= 0
+                            for field in ("payload", "staging")
+                        )
+                        or type(reservation.get("cancelled")) is not bool
+                    ):
+                        raise ValueError("Invalid live conditioning writer reservation")
+                    writers[identity] = reservation
+                else:
+                    for suffix in ("pending", "json", "json.pending", "lock"):
+                        (self.directory / f"writer-{identity}.{suffix}").unlink(missing_ok=True)
+        index["writers"] = writers
+        self._account_writers(index)
+
+    def _cancel_writers(self, index: dict[str, Any], digest: str | None = None) -> None:
+        for identity, reservation in index["writers"].items():
+            if digest is None or reservation["key"] == digest:
+                reservation["cancelled"] = True
+                self._writer_state(identity, reservation)
+
+    def _reserve_payload(self, index: dict[str, Any], size: int) -> bool:
+        required = sum(entry["size"] for entry in index["entries"].values()) + index["reserved_bytes"] + size
+        for victim in sorted(index["entries"], key=lambda item: index["entries"][item]["access"]):
+            if required <= self.max_bytes:
+                break
+            victim_size = index["entries"][victim]["size"]
+            if self._remove(victim, index):
+                required -= victim_size
+                self._count("evictions", 1)
+        return required <= self.max_bytes
 
     def _save_index(self, index: dict[str, Any]) -> None:
         temporary = self.directory / "index.pending"
@@ -549,14 +687,20 @@ class ConditioningCache:
         index["entries"].pop(key, None)
         return True
 
-    def lookup(self, key: str) -> ConditioningLease | None:
-        # Protect this client's lifetime while releasing the shared namespace
-        # lock during hashing/mapping. Other workers can read concurrently.
-        with self._mutex:
-            return self._lookup(key)
+    def lookup(self, key: str, *, max_bytes: int | None = None) -> ConditioningLease | None:
+        """Borrow a validated entry, optionally bounded by its full file
+        size."""
+        if max_bytes is not None and max_bytes < 0:
+            raise ValueError("Lookup byte limit must be nonnegative")
+        with self._operation() as active:
+            if not active:
+                self._count("lookups", 1)
+                self._count("misses", 1)
+                return None
+            return self._lookup(key, max_bytes=max_bytes)
 
-    def _lookup(self, key: str) -> ConditioningLease | None:
-        self._counters["lookups"] += 1
+    def _lookup(self, key: str, *, max_bytes: int | None = None) -> ConditioningLease | None:
+        self._count("lookups", 1)
         started, hit = time.perf_counter(), False
         descriptor = reader = None
         digest, entry = "", None
@@ -571,16 +715,26 @@ class ConditioningCache:
                     return None
                 if not _valid_entry(digest, entry):
                     raise ValueError("Invalid conditioning cache entry")
+                if max_bytes is not None and entry["size"] > max_bytes:
+                    self._count("bypasses", 1)
+                    return None
                 path = self.directory / f"{digest}.safetensors"
                 if entry.get("invalid") or path.stat().st_size != entry["size"]:
                     raise ValueError("Invalid conditioning payload size")
                 descriptor = path.open("rb")
                 fcntl.flock(descriptor.fileno(), fcntl.LOCK_SH)
-            self._counters["checksum_bytes"] += entry["size"]
-            if fingerprint_file(path) != entry["sha256"]:
+                identity = ConditioningLease._stat_identity(os.fstat(descriptor.fileno()))
+            self._count("checksum_bytes", entry["size"])
+            checksum_started = time.perf_counter()
+            try:
+                checksum = fingerprint_file(path)
+            finally:
+                self._count("checksum_seconds", time.perf_counter() - checksum_started)
+            if checksum != entry["sha256"]:
                 raise ValueError("Conditioning payload checksum mismatch")
             from safetensors import safe_open
 
+            map_started = time.perf_counter()
             reader = safe_open(str(path), framework="pt", device="cpu")
             reader.__enter__()
             metadata = reader.metadata() or {}
@@ -588,6 +742,7 @@ class ConditioningCache:
                 raise ValueError("Invalid conditioning payload format")
             schema, tensors = json.loads(metadata["tree"]), {}
             data = _restore(schema, reader, tensors)
+            self._count("map_seconds", time.perf_counter() - map_started)
             with self._locked():
                 index = self._index(recover=False)
                 current = index["entries"].get(digest)
@@ -596,11 +751,13 @@ class ConditioningCache:
                 current["access"] = time.time_ns()
                 self._save_index(index)
             lease = ConditioningLease(self, descriptor, reader, data, schema, tensors, metadata)
+            if lease._identity != identity or not lease.is_unchanged():
+                raise ValueError("Conditioning payload changed during validation")
             self._leases.add(lease)
             descriptor = reader = None
-            self._counters["hits"] += 1
-            self._counters["read_bytes"] += entry["size"]
-            self._counters["reused_tensor_bytes"] += entry["tensor_bytes"]
+            self._count("hits", 1)
+            self._count("read_bytes", entry["size"])
+            self._count("reused_tensor_bytes", entry["tensor_bytes"])
             hit = True
             return lease
         except Exception as error:
@@ -622,29 +779,36 @@ class ConditioningCache:
             except Exception as cleanup_error:
                 self._error("invalidate", cleanup_error)
             if entry is not None:
-                self._counters["corruptions"] += 1
+                self._count("corruptions", 1)
             self._error("lookup", error)
         finally:
             if reader is not None:
                 reader.__exit__(None, None, None)
             if descriptor is not None:
                 descriptor.close()
-            self._counters["load_seconds"] += time.perf_counter() - started
+            self._count("load_seconds", time.perf_counter() - started)
             if not hit:
-                self._counters["misses"] += 1
+                self._count("misses", 1)
         return None
 
     def put(self, key: str, tree: Any) -> bool:
-        started = time.perf_counter()
-        try:
-            if self._closed or self._client_file is None:
-                self._counters["bypasses"] += 1
+        with self._operation() as active:
+            if not active:
+                self._count("bypasses", 1)
                 return False
+            return self._put(key, tree)
+
+    def _put(self, key: str, tree: Any) -> bool:
+        started = time.perf_counter()
+        identity, writer = uuid.uuid4().hex, None
+        host_bytes = 0
+        temporary = self.directory / f"writer-{identity}.pending"
+        try:
             tensors: dict[str, Any] = {}
             schema = json.dumps(_flatten(tree, tensors), separators=(",", ":"), allow_nan=False)
             tensor_bytes = sum(tensor.numel() * tensor.element_size() for tensor in tensors.values())
             if tensor_bytes + len(schema.encode()) > self.max_bytes:
-                self._counters["bypasses"] += 1
+                self._count("bypasses", 1)
                 return False
             digest = hashlib.sha256(key.encode()).hexdigest()
             with self._locked():
@@ -653,79 +817,111 @@ class ConditioningCache:
                     if not index["entries"][digest].get("invalid"):
                         return False
                     if not self._remove(digest, index):
-                        self._counters["bypasses"] += 1
+                        self._count("bypasses", 1)
                         return False
-                staging = 3 * tensor_bytes + 2 * _serialization_bound(tensors, schema, tensor_bytes)
-                if staging > self.max_staging_bytes:
-                    self._counters["bypasses"] += 1
+                if any(item["key"] == digest for item in index["writers"].values()):
+                    self._count("bypasses", 1)
                     return False
-                index["staging_reserved_bytes"] = staging
+                staging = 3 * tensor_bytes + 2 * _serialization_bound(tensors, schema, tensor_bytes)
+                if staging + index["staging_reserved_bytes"] > self.max_staging_bytes:
+                    self._count("bypasses", 1)
+                    return False
+                writer = (self.directory / f"writer-{identity}.lock").open("x+b")
+                fcntl.flock(writer.fileno(), fcntl.LOCK_EX)
+                reservation = {"key": digest, "payload": 0, "staging": staging, "cancelled": False}
+                self._writer_state(identity, reservation)
+                index["writers"][identity] = reservation
+                self._account_writers(index)
                 self._save_index(index)
                 self._counters["peak_staging_reserved_bytes"] = max(
-                    self._counters["peak_staging_reserved_bytes"], staging
+                    self._counters["peak_staging_reserved_bytes"], index["staging_reserved_bytes"]
                 )
-                try:
-                    from safetensors.torch import save
+            from safetensors.torch import save
 
-                    cpu_tensors, storage_ids = {}, set()
-                    for name, tensor in tensors.items():
-                        value = tensor.detach().to(device="cpu").contiguous()
-                        storage_id = value.untyped_storage().data_ptr()
-                        if storage_id in storage_ids:
-                            value = value.clone()
-                        storage_ids.add(storage_id)
-                        cpu_tensors[name] = value
-                    payload = save(cpu_tensors, metadata={"format": str(_FORMAT), "tree": schema})
-                    size = len(payload)
-                    # Only one writer serializes per node. This upper bound includes
-                    # its CPU staging tensors and serialized bytes, not caller-owned
-                    # inputs or consumer-owned GPU copies.
-                    self._counters["peak_temporary_host_bytes"] = max(
-                        self._counters["peak_temporary_host_bytes"], tensor_bytes + size
-                    )
-                    if size > self.max_bytes:
-                        self._counters["bypasses"] += 1
-                        return False
-                    required = sum(entry["size"] for entry in index["entries"].values()) + size
-                    for victim in sorted(index["entries"], key=lambda item: index["entries"][item]["access"]):
-                        if required <= self.max_bytes:
-                            break
-                        victim_size = index["entries"][victim]["size"]
-                        if self._remove(victim, index):
-                            required -= victim_size
-                            self._counters["evictions"] += 1
-                    if required > self.max_bytes:
-                        self._save_index(index)
-                        self._counters["bypasses"] += 1
-                        return False
-                    index["reserved_bytes"] = size
+            # Heavy work is protected by this writer's reservation and owner
+            # lock, never by the shared namespace lock.
+            copy_started = time.perf_counter()
+            host_bytes = tensor_bytes
+            self._host_staging(host_bytes)
+            cpu_tensors, storage_ids = {}, set()
+            for name, tensor in tensors.items():
+                value = tensor.detach().to(device="cpu").contiguous()
+                storage_id = value.untyped_storage().data_ptr()
+                if storage_id in storage_ids:
+                    value = value.clone()
+                storage_ids.add(storage_id)
+                cpu_tensors[name] = value
+            self._count("d2h_seconds", time.perf_counter() - copy_started)
+            serialize_started = time.perf_counter()
+            payload = save(cpu_tensors, metadata={"format": str(_FORMAT), "tree": schema})
+            self._count("serialize_seconds", time.perf_counter() - serialize_started)
+            size = len(payload)
+            self._host_staging(size)
+            host_bytes += size
+            with self._locked():
+                index = self._index()
+                reservation = index["writers"][identity]
+                if reservation["cancelled"] or size > self.max_bytes or not self._reserve_payload(index, size):
                     self._save_index(index)
-                    self._counters["peak_reserved_bytes"] = max(self._counters["peak_reserved_bytes"], size)
-                    temporary = self.directory / "payload.pending"
-                    try:
-                        temporary.write_bytes(payload)
-                        os.replace(temporary, self.directory / f"{digest}.safetensors")
-                        index["entries"][digest] = {
-                            "size": size,
-                            "tensor_bytes": tensor_bytes,
-                            "access": time.time_ns(),
-                            "sha256": hashlib.sha256(payload).hexdigest(),
-                        }
-                    finally:
-                        temporary.unlink(missing_ok=True)
-                        index["reserved_bytes"] = 0
-                        self._save_index(index)
-                    self._counters["writes"] += 1
-                    self._counters["write_bytes"] += size
-                    return True
-                finally:
-                    index["staging_reserved_bytes"] = 0
-                    self._save_index(index)
+                    self._count("bypasses", 1)
+                    return False
+                reservation["payload"] = size
+                self._writer_state(identity, reservation)
+                self._account_writers(index)
+                self._save_index(index)
+                self._counters["peak_reserved_bytes"] = max(
+                    self._counters["peak_reserved_bytes"], index["reserved_bytes"]
+                )
+            write_started = time.perf_counter()
+            temporary.write_bytes(payload)
+            self._count("file_write_seconds", time.perf_counter() - write_started)
+            checksum_started = time.perf_counter()
+            checksum = hashlib.sha256(payload).hexdigest()
+            self._count("checksum_seconds", time.perf_counter() - checksum_started)
+            with self._locked():
+                index = self._index()
+                reservation = index["writers"][identity]
+                if reservation["cancelled"]:
+                    self._count("bypasses", 1)
+                    return False
+                os.replace(temporary, self.directory / f"{digest}.safetensors")
+                index["entries"][digest] = {
+                    "size": size,
+                    "tensor_bytes": tensor_bytes,
+                    "access": time.time_ns(),
+                    "sha256": checksum,
+                }
+                # The file is now charged as an entry. Staging remains charged
+                # until our CPU buffers are dropped in the finally block.
+                reservation["payload"] = 0
+                self._writer_state(identity, reservation)
+                self._account_writers(index)
+                self._save_index(index)
+            self._count("writes", 1)
+            self._count("write_bytes", size)
+            return True
         except Exception as error:
             self._error("write", error)
             return False
         finally:
-            self._counters["save_seconds"] += time.perf_counter() - started
+            # Release staging references before returning their reservation.
+            # Caller-owned tensor storage was never included in this budget.
+            cpu_tensors = payload = value = None
+            if host_bytes:
+                self._host_staging(-host_bytes)
+            if writer is not None:
+                try:
+                    with self._locked():
+                        temporary.unlink(missing_ok=True)
+                        writer.close()
+                        writer = None
+                        index = self._index()
+                        self._save_index(index)
+                except Exception as error:
+                    self._error("writer cleanup", error)
+                    if writer is not None:
+                        writer.close()
+            self._count("save_seconds", time.perf_counter() - started)
 
     def _storage(self, index: dict[str, Any]) -> dict[str, int]:
         result = self._empty_storage()
@@ -733,7 +929,7 @@ class ConditioningCache:
         result["resident_bytes"] = sum(entry["size"] for entry in index["entries"].values())
         result["bytes_reserved"] = index["reserved_bytes"]
         result["staging_reserved_bytes"] = index["staging_reserved_bytes"]
-        result["inflight_writes"] = int(index["staging_reserved_bytes"] > 0)
+        result["inflight_writes"] = len(index["writers"])
         for key, entry in index["entries"].items():
             with (self.directory / f"{key}.safetensors").open("rb") as descriptor:
                 try:
@@ -743,14 +939,20 @@ class ConditioningCache:
         result["metadata_bytes"] = sum(
             path.stat().st_size
             for path in self.directory.iterdir()
-            if path.suffix != ".safetensors" and path.name != "payload.pending"
+            if path.suffix != ".safetensors"
+            and path.name != "payload.pending"
+            and not (path.name.startswith("writer-") and path.suffix == ".pending" and ".json." not in path.name)
         )
         result["total_bytes"] = result["resident_bytes"] + result["bytes_reserved"] + result["metadata_bytes"]
         return result
 
     def stats(self) -> dict[str, int | float | str]:
+        with self._operation():
+            return self._stats()
+
+    def _stats(self) -> dict[str, int | float | str]:
         scope = "last_detailed_snapshot"
-        if not self._closed and self._client_file is not None:
+        if not self._closed and not self._closing and self._client_file is not None:
             try:
                 with self._locked():
                     self._reap_clients()
@@ -777,9 +979,13 @@ class ConditioningCache:
         filesystem scan and are explicitly unknown here. Closed clients also
         report unknown accounting rather than a stale snapshot.
         """
+        with self._operation():
+            return self._stats_light()
+
+    def _stats_light(self) -> dict[str, int | float | str | None]:
         storage: dict[str, int | None] = dict.fromkeys(self._empty_storage(), None)
         scope = "unavailable"
-        if not self._closed and self._client_file is not None:
+        if not self._closed and not self._closing and self._client_file is not None:
             try:
                 with self._locked():
                     index = self._index(recover=False)
@@ -793,7 +999,7 @@ class ConditioningCache:
                         resident_bytes=sum(entry["size"] for entry in index["entries"].values()),
                         bytes_reserved=index["reserved_bytes"],
                         staging_reserved_bytes=index["staging_reserved_bytes"],
-                        inflight_writes=int(index["staging_reserved_bytes"] > 0),
+                        inflight_writes=len(index["writers"]),
                     )
                     scope = "index_accounting"
             except Exception as error:
@@ -815,12 +1021,15 @@ class ConditioningCache:
         Returns False while any worker still borrows this entry; the caller
         should release its own lease before invalidating and recomputing.
         """
-        if self._closed or self._client_file is None:
-            return True
+        with self._operation() as active:
+            return self._invalidate(key) if active else True
+
+    def _invalidate(self, key: str) -> bool:
         try:
             with self._locked():
                 index = self._index()
                 digest = hashlib.sha256(key.encode()).hexdigest()
+                self._cancel_writers(index, digest)
                 if digest in index["entries"]:
                     index["entries"][digest]["invalid"] = True
                 removed = self._remove(digest, index)
@@ -831,23 +1040,42 @@ class ConditioningCache:
             return False
 
     def clear(self) -> bool:
-        if self._closed or self._client_file is None:
-            return True
+        with self._operation() as active:
+            return self._clear() if active else True
+
+    def _clear(self) -> bool:
         try:
             with self._locked():
                 index = self._index()
+                self._cancel_writers(index)
                 for key in list(index["entries"]):
                     self._remove(key, index)
                 self._save_index(index)
-                return not index["entries"]
+                return not index["entries"] and not index["writers"]
         except Exception as error:
             self._error("clear", error)
             return False
 
     def close(self) -> None:
-        if self._closed:
-            return
+        with self._lifecycle:
+            while self._closing and not self._closed:
+                self._lifecycle.wait()
+            if self._closed:
+                return
+            self._closing = True
+            self._lifecycle.notify_all()
+            try:
+                self._lifecycle.wait_for(lambda: self._active_operations == 0)
+            except BaseException:
+                self._closing = False
+                self._lifecycle.notify_all()
+                raise
+        completed = False
         try:
+            # A signal may arrive after the final file close but before the
+            # assignment below. All client/lease cleanup precedes that close.
+            if self._lock_file is not None and self._lock_file.closed:
+                self._lock_file = None
             if self._lock_file is not None:
                 with self._locked():
                     for lease in list(self._leases):
@@ -855,17 +1083,26 @@ class ConditioningCache:
                     if self._client_file is not None:
                         self._client_file.close()
                         self._client_file = None
-                        self._client_path.unlink(missing_ok=True)
-                        if not self._reap_clients():
-                            shutil.rmtree(self.directory)
-                            self._last_storage = self._empty_storage()
-        except Exception as error:
-            self._error("close", error)
-        finally:
-            self._closed = True
-            if self._lock_file is not None:
+                    # Retry this even when an earlier attempt already closed
+                    # the client FD but was interrupted while unlinking it.
+                    self._client_path.unlink(missing_ok=True)
+                    if self.directory.exists() and not self._reap_clients():
+                        shutil.rmtree(self.directory)
+                        self._last_storage = self._empty_storage()
                 self._lock_file.close()
                 self._lock_file = None
+            completed = True
+        except Exception as error:
+            self._error("close", error)
+            raise
+        finally:
+            # Keep the namespace lock FD for retry after incomplete cleanup.
+            # Propagate failures so the owning runtime can also retain its
+            # retryable state rather than claiming successful release.
+            with self._lifecycle:
+                self._closed = completed
+                self._closing = False
+                self._lifecycle.notify_all()
 
     def __enter__(self) -> ConditioningCache:
         return self

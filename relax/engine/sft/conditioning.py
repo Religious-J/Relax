@@ -106,6 +106,7 @@ class ConditioningRuntime:
         self._conditioning_started = time.monotonic()
         self._started = self._conditioning_started if trainer_started is None else trainer_started
         self._closed = False
+        self._close_event_written = False
         self._events: list[tuple[Any, Any]] = []
         self._step: defaultdict[str, int | float] = defaultdict(int)
         self._last_end: float | None = None
@@ -123,6 +124,11 @@ class ConditioningRuntime:
         self._cache_guard_reason = getattr(model, "conditioning_reuse_disabled_reason", None)
         self._writer: Any = None
         self.cache: ConditioningCache | None = None
+        self._prefetch: Any = None
+        self.prefetch_depth = int(os.environ.get("RELAX_CONDITION_PREFETCH_DEPTH", "0"))
+        prefetch_bytes = int(os.environ.get("RELAX_CONDITION_PREFETCH_MAX_BYTES", str(512 * 1024**2)))
+        if self.prefetch_depth < 0 or (self.prefetch_depth and prefetch_bytes <= 0):
+            raise ValueError("Conditioning prefetch requires nonnegative depth and positive byte capacity")
         # Fingerprinting failures are broadcast rather than stranding peers.
         fingerprint: list[Any] = [None]
         if rank == 0:
@@ -143,6 +149,10 @@ class ConditioningRuntime:
             self.cache = ConditioningCache(maximum, directory, f"{namespace}:{socket.gethostname()}")
         directory = os.environ.get("RELAX_CONDITION_CACHE_RUN_DIR")
         try:
+            if self.enabled and self.prefetch_depth:
+                from relax.engine.sft.conditioning_prefetch import ConditioningPrefetch
+
+                self._prefetch = ConditioningPrefetch(self.cache, depth=self.prefetch_depth, max_bytes=prefetch_bytes)
             if directory:
                 run_directory = Path(directory)
                 run_directory.mkdir(parents=True, exist_ok=True)
@@ -165,14 +175,21 @@ class ConditioningRuntime:
                     "conditioning_init_seconds": time.monotonic() - self._conditioning_started,
                     "total_seconds_scope": "trainer lifetime; model and Ray startup excluded (see external job.json)",
                     "cache_enabled": self.enabled,
+                    "prefetch_depth": self.prefetch_depth if self.enabled else 0,
+                    "prefetch_max_bytes": prefetch_bytes if self._prefetch is not None else 0,
+                    "prefetch_scope": "validated CPU leases; device copies remain on the training thread",
                 }
             )
             self._model.conditioning_cache = self
         except BaseException:
-            if self.cache is not None:
-                self.cache.close()
-            if self._writer is not None:
-                self._writer.close()
+            # No prefetch can be submitted until initialization returns. Try
+            # every cleanup, retaining the original initialization exception.
+            for resource in (self._prefetch, self.cache, self._writer):
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except BaseException as cleanup_error:
+                        logger.warning("Conditioning initialization cleanup failed: %s", cleanup_error)
             self._closed = True
             raise
 
@@ -247,6 +264,36 @@ class ConditioningRuntime:
     def record_prepare(self, seconds: float) -> None:
         self._step["condition_prepare_seconds"] += seconds
 
+    @property
+    def prefetch_enabled(self) -> bool:
+        return self._prefetch is not None and not self._closed
+
+    def _conditioning_key(self, spec: ConditioningSpec) -> str:
+        return build_key({"weights": self.fingerprint, "schema": spec.name, "dependencies": spec.dependencies})
+
+    def prefetch(self, spec: ConditioningSpec) -> bool:
+        """Schedule CPU storage work for an already prepared effective
+        input."""
+        if not self.prefetch_enabled or self.force_online or self._cache_guard_disabled or not spec.cacheable:
+            return False
+        return self._prefetch.submit(self._conditioning_key(spec))
+
+    def prefetch_many(self, specs: list[ConditioningSpec]) -> int:
+        """Replace the bounded future window, without model work or
+        collectives.
+
+        The caller prepares inputs on the original RNG stream/order. Resolve
+        rebuilds the actual key and still checks the frozen-parameter guard;
+        this method never treats a sample ID as a cache identity.
+        """
+        if not self.prefetch_enabled:
+            return 0
+        if self.force_online or self._cache_guard_disabled:
+            self._prefetch.clear()
+            return 0
+        keys = [self._conditioning_key(spec) for spec in specs if spec.cacheable]
+        return self._prefetch.set_window(keys)
+
     def resolve(
         self,
         spec: ConditioningSpec,
@@ -259,10 +306,18 @@ class ConditioningRuntime:
         key = None
         lookup_started = time.perf_counter()
         reusable = self.enabled and spec.cacheable and not self._cache_guard_disabled
+        if self._prefetch is not None and (not reusable or self.force_online):
+            self._prefetch.clear()
         if reusable:
             try:
-                key = build_key({"weights": self.fingerprint, "schema": spec.name, "dependencies": spec.dependencies})
-                lease = None if self.force_online else self.cache.lookup(key)
+                key = self._conditioning_key(spec)
+                lease = None
+                if not self.force_online:
+                    if self._prefetch is not None:
+                        lease = self._prefetch.take(key)
+                        self._step["prefetch_hit"] += int(lease is not None)
+                    if lease is None:
+                        lease = self.cache.lookup(key)
                 if lease is not None:
                     with lease:
                         copied_bytes = 0
@@ -373,6 +428,7 @@ class ConditioningRuntime:
                 "cache_write_bytes",
                 "condition_payload_bytes",
                 "cache_errors",
+                "prefetch_hit",
             )
         }
         self._write(
@@ -417,6 +473,7 @@ class ConditioningRuntime:
             "cache_storage_scope": scope,
             "cache_stats_detailed": scope == "filesystem",
             "disk_bytes": 0,
+            "prefetch_stats": self._prefetch.stats() if self._prefetch is not None else {},
         }
         try:
             stat = os.statvfs("/dev/shm")
@@ -440,9 +497,14 @@ class ConditioningRuntime:
         if self._closed:
             return
         started = time.monotonic()
-        try:
-            if self.cache is not None:
-                self.cache.close()
+        # Keep the runtime retryable if draining is interrupted. In particular,
+        # the cache cannot close while its read-ahead worker still owns a read.
+        # Do not run later cleanup in a finally that could mask this exception.
+        if self._prefetch is not None:
+            self._prefetch.close()
+        if self.cache is not None:
+            self.cache.close()
+        if not self._close_event_written:
             self._write(
                 {
                     "stage": "close",
@@ -454,8 +516,8 @@ class ConditioningRuntime:
                     **self._resources(detailed=True),
                 }
             )
-        finally:
-            self._model.conditioning_cache = None
-            self._closed = True
-            if self._writer is not None:
-                self._writer.close()
+            self._close_event_written = True
+        if self._writer is not None:
+            self._writer.close()
+        self._model.conditioning_cache = None
+        self._closed = True
