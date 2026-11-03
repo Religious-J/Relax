@@ -142,6 +142,7 @@ class TinyPosteriorVAE(TinyVAE):
         self.fail_encode = False
         self._feat_cache = []
         self.posterior = None
+        self.posterior_memory_format = torch.contiguous_format
         self.register_buffer("offset", torch.tensor(0.0))
 
     def clear_cache(self):
@@ -157,7 +158,9 @@ class TinyPosteriorVAE(TinyVAE):
         self._feat_cache = [base]
         if self.fail_encode:
             raise RuntimeError("VAE encode interrupted")
-        self.posterior = DiagonalGaussianDistribution(torch.cat((base, torch.full_like(base, -4.0)), dim=1))
+        parameters = torch.cat((base, torch.full_like(base, -4.0)), dim=1)
+        parameters = torch.empty_like(parameters, memory_format=self.posterior_memory_format).copy_(parameters)
+        self.posterior = DiagonalGaussianDistribution(parameters)
         self.clear_cache()
         return SimpleNamespace(latent_dist=self.posterior)
 
@@ -602,9 +605,16 @@ def test_scheduler_timestep_is_divided_in_fp32_before_transformer_compute(monkey
     assert not torch.equal(rounded_early, expected), "Fixture must expose early BF16 timestep rounding"
 
 
-@pytest.mark.parametrize("posterior_bundle", [False, True])
-def test_public_verifier_compares_complete_two_sample_batch_and_fp32_update(cache_runtime, tmp_path, posterior_bundle):
+@pytest.mark.parametrize(
+    "posterior_bundle,memory_format",
+    [(False, None), (True, torch.contiguous_format), (True, torch.channels_last_3d)],
+)
+def test_public_verifier_compares_complete_two_sample_batch_and_fp32_update(
+    cache_runtime, tmp_path, posterior_bundle, memory_format
+):
     model = (_posterior_model if posterior_bundle else _model)(dtype=torch.float32)
+    if posterior_bundle:
+        model.vae.posterior_memory_format = memory_format
     runtime = cache_runtime(model)
     parameters = [(name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad]
     optimizer = torch.optim.AdamW([parameter for _, parameter in parameters], lr=0.01)
@@ -707,17 +717,42 @@ def test_online_and_cached_normal_micro_loops_preserve_random_augmentation_order
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_joint_bundle_preserves_posterior_bits_and_original_cold_object(cache_runtime, dtype):
+@pytest.mark.parametrize("memory_format", [torch.contiguous_format, torch.channels_last_3d])
+@pytest.mark.parametrize("degenerate", [False, True])
+def test_joint_bundle_preserves_posterior_bits_and_original_cold_object(
+    cache_runtime, dtype, memory_format, degenerate
+):
     model = _posterior_model(dtype)
+    model.vae.posterior_memory_format = memory_format
     runtime = cache_runtime(model)
     runtime.sample(0)
+    data = _sample()
+    if degenerate:
+        data["image"] = data["image"].resize((8, 8))
     initial_rng = torch.get_rng_state().clone()
     runtime.force_online = True
-    cold = model._conditioning_features(_sample())
+    cold = model._conditioning_features(data)
     assert cold["posterior"] is model.vae.posterior
+    parameters = cold["posterior"].parameters
+    assert parameters.is_contiguous(memory_format=memory_format)
+    if degenerate:
+        # Both formats describe the same element order when spatial axes are 1.
+        assert parameters.is_contiguous() and parameters.is_contiguous(memory_format=torch.channels_last_3d)
+    else:
+        assert parameters.is_contiguous() is (memory_format == torch.contiguous_format)
+    field = "posterior_parameters" if parameters.is_contiguous() else "posterior_parameters_channels_last_3d"
+    key = runtime._conditioning_key(model.conditioning_spec(data))
+    with runtime.cache.lookup(key) as lease:
+        assert set(lease.data) == {"prompt_embeds", field}
+        assert lease.data[field].is_contiguous(), "The real public store canonicalizes both layouts"
     runtime.force_online = False
-    hot = model._conditioning_features(_sample())
+    hot = model._conditioning_features(data)
     assert hot["posterior"] is not cold["posterior"]
+    assert hot["posterior"].parameters.is_contiguous(memory_format=memory_format)
+    if not degenerate:
+        assert hot["posterior"].parameters.stride() == parameters.stride()
+    elif memory_format == torch.channels_last_3d:
+        assert hot["posterior"].parameters.stride() != parameters.stride()
     assert model.text_encoder.calls == model.vae.calls == 1
     assert runtime._step["encoding_calls"] == runtime._step["effective_hit"] == 1
     assert torch.equal(initial_rng, torch.get_rng_state()), "Neither branch may sample while resolving"
@@ -726,25 +761,51 @@ def test_joint_bundle_preserves_posterior_bits_and_original_cold_object(cache_ru
         (cold["posterior"].parameters, hot["posterior"].parameters),
     ):
         assert reference.dtype == actual.dtype == dtype
-        assert torch.equal(reference.view(torch.uint8), actual.view(torch.uint8))
+        assert torch.equal(reference.reshape(-1).view(torch.uint8), actual.reshape(-1).view(torch.uint8))
+    # Sampling and the next random draw retain logical element correspondence,
+    # including the ambiguous-format singleton case.
+    sampled, noises, states = [], [], []
+    for features in (cold, hot):
+        torch.manual_seed(73)
+        sampled.append(features["posterior"].sample())
+        noises.append(torch.randn_like(sampled[-1]))
+        states.append(torch.get_rng_state().clone())
+    assert torch.equal(sampled[0], sampled[1]) and torch.equal(noises[0], noises[1])
+    assert torch.equal(states[0], states[1])
+    for actual in (hot["prompt_embeds"], hot["posterior"].parameters):
         actual.zero_()
-    fresh = model._conditioning_features(_sample())
+    fresh = model._conditioning_features(data)
     assert torch.equal(fresh["posterior"].parameters, cold["posterior"].parameters)
     assert torch.equal(fresh["prompt_embeds"], cold["prompt_embeds"])
 
 
-def test_joint_bundle_samples_noise_and_timestep_online_with_identical_rng(cache_runtime, monkeypatch):
-    model = _posterior_model()
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("memory_format", [torch.contiguous_format, torch.channels_last_3d])
+def test_joint_bundle_samples_noise_and_timestep_online_with_identical_rng(
+    cache_runtime, monkeypatch, dtype, memory_format
+):
+    from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+    model = _posterior_model(dtype)
+    model.vae.posterior_memory_format = memory_format
     runtime = cache_runtime(model)
     runtime.sample(0)
     captured = []
+    sampled = []
     objective = sft_adapter.flow_matching_loss
+    original_sample = DiagonalGaussianDistribution.sample
+
+    def sample(posterior, *args, **kwargs):
+        value = original_sample(posterior, *args, **kwargs)
+        sampled.append(value.detach().clone())
+        return value
 
     def record(transformer, clean, prompt, noise, sigma, timestep):
         captured.append(tuple(value.detach().clone() for value in (clean, noise, sigma, timestep)))
         return objective(transformer, clean, prompt, noise, sigma, timestep)
 
     monkeypatch.setattr(sft_adapter, "flow_matching_loss", record)
+    monkeypatch.setattr(DiagonalGaussianDistribution, "sample", sample)
     states, losses = [], []
     for force_online in (True, False):
         runtime.force_online = force_online
@@ -754,8 +815,11 @@ def test_joint_bundle_samples_noise_and_timestep_online_with_identical_rng(cache
     assert model.vae.calls == model.text_encoder.calls == 4
     assert runtime._step["encoding_calls"] == runtime._step["effective_hit"] == 4
     assert torch.equal(losses[0], losses[1]) and torch.equal(states[0], states[1])
+    for reference, actual in zip(sampled[:4], sampled[4:]):
+        assert torch.equal(reference, actual) and reference.stride() == actual.stride()
     for reference, actual in zip(captured[:4], captured[4:]):
         assert all(torch.equal(left, right) for left, right in zip(reference, actual))
+        assert all(left.stride() == right.stride() for left, right in zip(reference, actual))
     assert not torch.equal(captured[0][0], captured[1][0])
     assert not torch.equal(captured[0][1], captured[1][1])
 
@@ -777,7 +841,7 @@ def test_joint_bundle_dependencies_cover_actual_augmented_image_and_vae(field):
         model.compute_dtype = torch.float32
     else:
         model.pipe.vae_scale_factor = 16
-    assert model.conditioning_spec(data).name == reference.name == "qwen_image.text_vae_posterior.v1"
+    assert model.conditioning_spec(data).name == reference.name == "qwen_image.text_vae_posterior.v2"
     assert build_key(model.conditioning_spec(data).dependencies) != build_key(reference.dependencies)
 
 
@@ -798,7 +862,7 @@ def test_joint_bundle_reuses_image_content_and_effective_tokens_not_filenames(ca
     assert model.vae.calls == model.text_encoder.calls == 2
 
 
-@pytest.mark.parametrize("fault", ["dtype", "shape", "fields", "missing", "corrupt"])
+@pytest.mark.parametrize("fault", ["dtype", "shape", "fields", "both_layouts", "missing", "corrupt"])
 def test_bad_joint_bundle_falls_back_to_online_without_leases_or_rng_changes(cache_runtime, fault):
     model = _posterior_model()
     runtime = cache_runtime(model)
@@ -815,13 +879,13 @@ def test_bad_joint_bundle_falls_back_to_online_without_leases_or_rng_changes(cac
         runtime.cache.invalidate(key)
         parameters = expected["posterior"].parameters
         invalid = parameters.float() if fault == "dtype" else parameters[:, :1] if fault == "shape" else parameters
-        runtime.cache.put(
-            key,
-            {
-                "prompt_embeds": expected["prompt_embeds"],
-                "wrong" if fault == "fields" else "posterior_parameters": invalid,
-            },
-        )
+        payload = {
+            "prompt_embeds": expected["prompt_embeds"],
+            "wrong" if fault == "fields" else "posterior_parameters": invalid,
+        }
+        if fault == "both_layouts":
+            payload["posterior_parameters_channels_last_3d"] = parameters
+        runtime.cache.put(key, payload)
     initial_rng = torch.get_rng_state().clone()
     actual = model._conditioning_features(data)
     assert torch.equal(actual["posterior"].parameters, expected["posterior"].parameters)
@@ -829,6 +893,47 @@ def test_bad_joint_bundle_falls_back_to_online_without_leases_or_rng_changes(cac
     assert model.vae.calls == model.text_encoder.calls == 2
     assert runtime._step["effective_hit"] == 0
     assert runtime.cache.stats()["leased_bytes"] == 0
+
+
+@pytest.mark.parametrize("layout", ["transpose", "holes"])
+def test_joint_bundle_rejects_unsupported_posterior_layout_before_storage(cache_runtime, monkeypatch, layout):
+    from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+    model = _posterior_model()
+    runtime = cache_runtime(model)
+    runtime.sample(0)
+    original_encode = model.vae.encode
+
+    def encode(pixels):
+        parameters = original_encode(pixels).latent_dist.parameters
+        if layout == "transpose":
+            parameters = parameters.transpose(-2, -1)
+        else:
+            parameters = parameters.repeat_interleave(2, dim=-1)[..., ::2]
+        assert not parameters.is_contiguous()
+        assert not parameters.is_contiguous(memory_format=torch.channels_last_3d)
+        return SimpleNamespace(latent_dist=DiagonalGaussianDistribution(parameters))
+
+    monkeypatch.setattr(model.vae, "encode", encode)
+    initial_rng = torch.get_rng_state().clone()
+    with pytest.raises(ValueError, match="only contiguous or channels_last_3d"):
+        model(_sample())
+    assert runtime.cache.stats()["entries"] == 0
+    assert torch.equal(torch.get_rng_state(), initial_rng)
+    assert model.vae._feat_cache == []
+
+
+def test_joint_bundle_guard_exposes_parameter_and_buffer_stride_without_readback():
+    model = _posterior_model()
+    tensor = torch.zeros(1, 2, 1, 2, 2)
+    model.vae.register_parameter("layout_parameter", torch.nn.Parameter(tensor.clone(), requires_grad=False))
+    model.vae.register_buffer("layout_buffer", tensor.clone())
+    before = model.conditioning_state()["parameters"]
+    model.vae.to(memory_format=torch.channels_last_3d)
+    after = model.conditioning_state()["parameters"]
+    for name in ("vae.parameters.layout_parameter", "vae.buffers.layout_buffer"):
+        assert before[name]["stride"] != after[name]["stride"]
+        assert before[name]["shape"] == after[name]["shape"]
 
 
 @pytest.mark.parametrize("mutation", ["weight", "buffer", "train_mode", "trainable"])

@@ -272,6 +272,8 @@ class ConditioningRuntime:
                         if before[field] != current[field]:
                             reason = f"{name}.{field} changed"
                             break
+                    if reason is None and before.get("stride") != current.get("stride"):
+                        reason = f"{name}.stride changed"
                     if reason is not None:
                         break
             if reason is None:

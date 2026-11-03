@@ -119,6 +119,7 @@ class QwenImageSFTModel(torch.nn.Module):
                 "requires_grad": parameter.requires_grad,
                 "dtype": str(parameter.dtype),
                 "shape": tuple(parameter.shape),
+                "stride": tuple(parameter.stride()),
             }
         return {"frozen": self.conditioning_is_frozen(), "parameters": parameters}
 
@@ -191,7 +192,7 @@ class QwenImageSFTModel(torch.nn.Module):
                 )
         # Checkpoint content identity and mutation guards are supplied by the
         # public runtime; filenames and image identities never authorize reuse.
-        schema = "qwen_image.text_vae_posterior.v1" if self._cache_vae_posterior else "qwen_image.text.v1"
+        schema = "qwen_image.text_vae_posterior.v2" if self._cache_vae_posterior else "qwen_image.text.v1"
         return ConditioningSpec(schema, dependencies, cacheable)
 
     def conditioning_prefetch_spec(self, data: dict[str, Any]) -> ConditioningSpec:
@@ -292,16 +293,29 @@ class QwenImageSFTModel(torch.nn.Module):
                 with torch.no_grad():
                     online_posterior = self._encode_posterior(normalized)
                 # Cache deterministic distribution parameters, never a sample.
-                features["posterior_parameters"] = online_posterior.parameters
+                # Storage canonicalizes tensors, so encode the original dense
+                # layout in the field name without reading GPU metadata tensors.
+                parameters = online_posterior.parameters
+                if parameters.is_contiguous():
+                    field = "posterior_parameters"
+                elif parameters.ndim == 5 and parameters.is_contiguous(memory_format=torch.channels_last_3d):
+                    field = "posterior_parameters_channels_last_3d"
+                else:
+                    raise ValueError("Qwen posterior reuse supports only contiguous or channels_last_3d parameters")
+                features[field] = parameters
             return features
 
         def restore(features: dict[str, torch.Tensor]) -> dict[str, Any]:
             if pixels is None:
                 return self._restore_conditioning(features, length)
-            if set(features) != {"prompt_embeds", "posterior_parameters"}:
+            if set(features) == {"prompt_embeds", "posterior_parameters"}:
+                field, memory_format = "posterior_parameters", torch.contiguous_format
+            elif set(features) == {"prompt_embeds", "posterior_parameters_channels_last_3d"}:
+                field, memory_format = "posterior_parameters_channels_last_3d", torch.channels_last_3d
+            else:
                 raise ValueError("Cached Qwen-Image joint conditioning fields differ from the model")
             self._restore_conditioning({"prompt_embeds": features["prompt_embeds"]}, length)
-            parameters = features["posterior_parameters"]
+            parameters = features[field]
             expected = (
                 1,
                 2 * len(self.vae.config.latents_mean),
@@ -320,7 +334,9 @@ class QwenImageSFTModel(torch.nn.Module):
             else:
                 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 
-                posterior = DiagonalGaussianDistribution(parameters)
+                # Preserve sample/clean layout: the following randn_like(clean)
+                # maps random draws to elements according to that layout.
+                posterior = DiagonalGaussianDistribution(parameters.contiguous(memory_format=memory_format))
             return {"prompt_embeds": features["prompt_embeds"], "posterior": posterior}
 
         return restore(compute()) if resolver is None else resolver.resolve(spec, compute, restore)

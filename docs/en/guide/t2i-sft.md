@@ -89,7 +89,10 @@ entry. The key also covers the actual augmented RGB pixels, dimensions,
 normalization and VAE configuration. Posterior `sample()` still runs at its
 original position for every microbatch, followed by diffusion noise and timestep
 sampling; sampled latents are never cached. This mode requires VAE tiling and
-slicing to be disabled. Reuse requires the same effective image/caption pair;
+slicing to be disabled. Posterior parameters must use contiguous or `channels_last_3d`
+layout; the cache records and restores that layout before sampling so subsequent
+`randn_like` draws keep their element mapping. Other layouts are rejected.
+Reuse requires the same effective image/caption pair;
 identical captions across different target images are no longer reused separately.
 Crops and caption dropout keep their normal execution order and key their actual outputs.
 

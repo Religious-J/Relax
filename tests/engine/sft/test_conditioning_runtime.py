@@ -533,6 +533,66 @@ def test_initial_trainable_conditioning_state_disables_reuse(runtime_factory):
     assert runtime._cache_guard_reason == "prefix.weight.requires_grad is true"
 
 
+@pytest.mark.parametrize("execution_policy", ["unanimous", "rank_local"])
+def test_parameter_memory_format_change_without_identity_or_version_change_disables_reuse(
+    runtime_factory, monkeypatch, execution_policy
+):
+    runtime, model, _ = runtime_factory(execution_policy=execution_policy)
+    model.encoder = torch.nn.Conv2d(3, 4, 3, bias=False).eval().requires_grad_(False)
+    spec = ConditioningSpec("dummy.stride.v1", {"input": "same", "dtype": "float32"}, True)
+
+    def state():
+        parameter = model.encoder.weight
+        return {
+            "frozen": not parameter.requires_grad,
+            "parameters": {
+                "encoder.weight": {
+                    "identity": id(parameter),
+                    "version": parameter._version,
+                    "local_version": parameter._version,
+                    "requires_grad": parameter.requires_grad,
+                    "dtype": str(parameter.dtype),
+                    "shape": tuple(parameter.shape),
+                    "stride": tuple(parameter.stride()),
+                }
+            },
+        }
+
+    model.conditioning_state = state
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return {"value": model.encoder.weight.detach().clone()}
+
+    runtime.sample(0)
+    runtime.resolve(spec, compute, _restore)
+    runtime.resolve(spec, compute, _restore)
+    assert len(calls) == 1 and runtime._step["effective_hit"] == 1
+    before = state()["parameters"]["encoder.weight"]
+    model.encoder.to(memory_format=torch.channels_last)
+    after = state()["parameters"]["encoder.weight"]
+    # Module.to swaps .data for this conversion: ordinary version/identity
+    # guards alone cannot detect the changed layout and resulting RNG mapping.
+    assert before["identity"] == after["identity"] and before["version"] == after["version"]
+    assert before["stride"] != after["stride"]
+    runtime.sample(1)
+    assert runtime._cache_guard_disabled
+    assert runtime._cache_guard_reason == "encoder.weight.stride changed"
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("A layout change must neither read nor republish the old content key")
+
+    monkeypatch.setattr(runtime.cache, "lookup", forbidden)
+    monkeypatch.setattr(runtime.cache, "put", forbidden)
+    runtime.resolve(spec, compute, _restore)
+    model.encoder.to(memory_format=torch.contiguous_format)
+    runtime.sample(2)
+    runtime.resolve(spec, compute, _restore)
+    assert len(calls) == 3 and runtime._cache_guard_disabled
+    assert runtime._cache_guard_reason == "encoder.weight.stride changed"
+
+
 @pytest.mark.parametrize("failure", ["lookup", "put"])
 def test_cache_io_errors_keep_online_result_and_downstream_fp32_gradient(runtime_factory, monkeypatch, failure):
     runtime, model, _ = runtime_factory()
