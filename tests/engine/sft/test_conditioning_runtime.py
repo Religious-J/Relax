@@ -534,6 +534,42 @@ def test_initial_trainable_conditioning_state_disables_reuse(runtime_factory):
 
 
 @pytest.mark.parametrize("execution_policy", ["unanimous", "rank_local"])
+def test_nested_semantic_configuration_is_snapshotted_and_changes_disable_reuse(runtime_factory, execution_policy):
+    runtime, model, _ = runtime_factory(execution_policy=execution_policy)
+    semantic = {"rope": {"scaling": [1.0]}, "mode": "frozen"}
+    model.conditioning_state = lambda: {"frozen": True, "parameters": {}, "semantic": semantic}
+    runtime.sample(0)
+    expected = runtime.resolve(_spec(), lambda: {"value": torch.tensor([1.0])}, _restore)
+    snapshot = runtime._conditioning_semantic_snapshot
+    # A fresh declaration with different dictionary insertion order has the
+    # same semantics and must continue hitting the existing entry.
+    semantic = {"mode": "frozen", "rope": {"scaling": [1.0]}}
+    runtime.sample(0)
+    actual = runtime.resolve(_spec(), lambda: pytest.fail("Expected a hot condition"), _restore)
+    assert torch.equal(actual["condition"], expected["condition"])
+    assert not runtime._cache_guard_disabled
+    semantic["rope"]["scaling"][0] = 2.0
+    runtime.sample(0)
+    assert runtime._conditioning_semantic_snapshot == snapshot
+    actual = runtime.resolve(_spec(), lambda: {"value": torch.tensor([2.0])}, _restore)
+    assert torch.equal(actual["condition"], torch.tensor([2.0]))
+    assert runtime._cache_guard_disabled
+    assert runtime._cache_guard_reason == "conditioning semantic configuration changed"
+    semantic["rope"]["scaling"][0] = 1.0
+    runtime.sample(0)
+    assert runtime._cache_guard_disabled, "Returning to an earlier config must not revive the poisoned namespace"
+
+
+@pytest.mark.parametrize("semantic", [{"tensor": torch.ones(1)}, {"invalid": float("nan")}, {1: "invalid-key"}])
+def test_semantic_state_rejects_tensors_or_noncanonical_json_without_readback(runtime_factory, semantic):
+    runtime, model, _ = runtime_factory()
+    model.conditioning_state = lambda: {"frozen": True, "parameters": {}, "semantic": semantic}
+    runtime.sample(0)
+    assert runtime._cache_guard_disabled
+    assert runtime._cache_guard_reason.startswith("conditioning state inspection failed:")
+
+
+@pytest.mark.parametrize("execution_policy", ["unanimous", "rank_local"])
 def test_parameter_memory_format_change_without_identity_or_version_change_disables_reuse(
     runtime_factory, monkeypatch, execution_policy
 ):

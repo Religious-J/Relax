@@ -150,6 +150,7 @@ class ConditioningRuntime:
         self._repeated_sample = False
         self._model = model
         self._conditioning_snapshot: dict[str, Any] | None = None
+        self._conditioning_semantic_snapshot: str | None = None
         self._cache_guard_disabled = bool(getattr(model, "conditioning_reuse_disabled", False))
         self._cache_guard_reason = getattr(model, "conditioning_reuse_disabled_reason", None)
         self._writer: Any = None
@@ -245,8 +246,9 @@ class ConditioningRuntime:
     def _check_conditioning_state(self) -> None:
         """Fail closed on a conditioning-master change outside FSDP forward.
 
-        The adapter optionally declares ``frozen`` and named parameter
-        metadata. Sharded encoders still enter unanimous_ready: one poisoned
+        The adapter optionally declares ``frozen``, named tensor metadata and
+        CPU-only ``semantic`` configuration. Sharded encoders still enter
+        unanimous_ready: one poisoned
         shard owner makes the whole group compute. A collective-free replica
         instead bypasses reuse locally without changing its execution policy.
         """
@@ -259,9 +261,14 @@ class ConditioningRuntime:
         try:
             state = inspect_state()
             parameters = state["parameters"]
+            # Canonical JSON validates the CPU-only declaration and snapshots
+            # nested mutable dictionaries without retaining their references.
+            semantic = build_key({"semantic": state["semantic"]}) if "semantic" in state else None
             if not state["frozen"]:
                 name = next((name for name, value in parameters.items() if value["requires_grad"]), "conditioning")
                 reason = f"{name}.requires_grad is true"
+            elif self._conditioning_snapshot is not None and semantic != self._conditioning_semantic_snapshot:
+                reason = "conditioning semantic configuration changed"
             elif self._conditioning_snapshot is not None:
                 for name in sorted(set(parameters) | set(self._conditioning_snapshot)):
                     if name not in parameters or name not in self._conditioning_snapshot:
@@ -278,6 +285,7 @@ class ConditioningRuntime:
                         break
             if reason is None:
                 self._conditioning_snapshot = parameters
+                self._conditioning_semantic_snapshot = semantic
         except Exception as error:
             reason = f"conditioning state inspection failed: {type(error).__name__}: {error}"
         if reason is not None:

@@ -69,7 +69,7 @@ bash scripts/entrypoint/ray-job.sh \
 
 每次查找都在 CPU 上准备实际编码输入，在线计算直接消费同一份结果，避免构键后再次 tokenize 产生差异。词表或 tokenizer 设置变化只要影响有效 token 或索引就会失效；若这些设置变化后，编码器的全部有效输入仍完全相同，冻结确定性输出可以继续复用。无需每次序列化整个词表。数值验证的在线参考单独执行原有 tokenize 与 device 索引路径，检查这次准备流程的数值一致性。
 
-Runtime 在启动时计算 checkpoint 与 tokenizer 文件指纹。每个样本开始前，SenseNova 还会在 FSDP forward 外检查条件参数的身份、版本计数（含 DTensor 本地存储）、可训练性、dtype 和 shape。观察到标准 `copy_` 等原地更新、参数替换或条件参数变为可训练后，会对当前模型实例永久停用复用，所有 rank 继续通过协调后的在线路径计算。即使恢复原参数或重新挂载 resolver，也不会重新启用缓存，必须启动新的训练任务。运行时不会为变更后的编码器权重自动重建缓存。
+Runtime 在启动时计算 checkpoint 与 tokenizer 文件指纹。每个样本开始前，SenseNova 还会在 FSDP forward 外检查条件参数的身份、版本计数（含 DTensor 本地存储）、可训练性、dtype、shape 和 stride。还会检查条件分支的注册 buffer 及实际 RoPE、归一化、attention、视觉和激活配置。SenseNova 在确定性构造延迟初始化的位置张量时记录 metadata；正常首次初始化及受支持的设备迁移保留复用，外部替换或原地修改则停用缓存。观察到标准 `copy_` 等原地更新、参数替换或条件参数变为可训练后，会对当前模型实例永久停用复用，所有 rank 继续通过协调后的在线路径计算。即使恢复原参数或重新挂载 resolver，也不会重新启用缓存，必须启动新的训练任务。运行时不会为变更后的编码器权重自动重建缓存。
 
 该防护无法识别 `.data` 等绕过版本计数器的非标准写入。运行期间仍应保持 checkpoint/tokenizer 文件不变，因为启动时的文件指纹不会刷新。有效 tokenizer 与预处理设置继续参与每次查找的依赖键；修改适配层编码算法或特征 schema 时，也应更新声明中的 schema 版本。
 
@@ -107,7 +107,7 @@ Worker 按训练 attempt 和节点共享 namespace。正常结束、取消或进
 - `cacheable` 必须反映实际冻结参数边界。为 false 时，在线结果保留梯度，不得存储或 detach。
 - `compute` 返回扁平张量字典；`restore` 检查字段名、shape、dtype 和 device，并重建当前 forward 所需的模型对象。它不得修改借用张量，也不能在 lease 结束后继续持有 CPU 映射。
 
-SenseNova 额外提供 `conditioning_state()`，供参数变更防护使用。进程内的参数身份只用于检测替换，不进入共享缓存键。自定义适配提供这一 hook 时，应在 FSDP forward 外检查分片 master 的 metadata，不能将 FSDP 临时展开的完整参数视图误判为编码器被替换。
+SenseNova 额外提供 `conditioning_state()`，供状态变更防护使用。可选的 `semantic` 字段只接受 CPU 侧 JSON 配置，公共 runtime 保存其不可变规范化摘要；配置变化或声明无效时停用复用。适配层也必须将影响输出的配置加入每次查找的依赖键。SenseNova 对此使用 `sensenova.prefix.v3` schema。进程内的参数身份只用于检测替换，不进入共享缓存键。自定义适配提供这一 hook 时，应在 FSDP forward 外检查分片 master 的 metadata，不能将 FSDP 临时展开的完整参数视图误判为编码器被替换。
 
 不同 rank 可以处理不同输入。跳过编码器前，runtime 要求整个 FSDP 参数分片组中的每个 rank 都已取得并校验自己输入所需的条件。任一 rank 未命中或恢复失败，该 microstep 的所有 rank 都执行在线编码，保持 FSDP collective 一致。因此，本地命中也可能转为强制重算，分析收益时应看有效命中率。
 
@@ -139,3 +139,5 @@ python scripts/tools/benchmark_condition_cache.py \
 首个实际执行的步骤、step 索引为 16 倍数的步骤以及末步调用完整 `stats()`；成功的文件系统快照标记为 `cache_storage_scope=filesystem`、`cache_stats_detailed=true`。Close 也会在释放 client 后请求详细统计，但已关闭缓存返回的是 `last_detailed_snapshot`，不代表实时资源，runtime 会将当前缓存与磁盘占用保留为未知。应结合 namespace 的文件系统状态及外部资源释放前后快照核实清理。同一节点共享的缓存字节不能按 rank 重复求和。有效命中率较低时，先检查输入或键变化、staging bypass、容量压力和其他 rank 的 miss，再考虑增大缓存。
 
 数据与恢复行为见[图像编辑 SFT](./i2i-sft.md)，负载测量建议见[性能调优](./performance-tuning.md)。
+
+可复用的计划执行、来源校验、重复实验汇总及 FP32 快照比较工具见[实验工具说明](../../../scripts/benchmarks/conditioning_cache/README.md)。

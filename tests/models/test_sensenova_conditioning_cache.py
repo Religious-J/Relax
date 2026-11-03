@@ -155,6 +155,203 @@ def tiny_conditioning_model(monkeypatch):
     return model, data
 
 
+@pytest.fixture
+def public_conditioning_runtime(tmp_path, monkeypatch, tiny_conditioning_model):
+    """Real tiny vision/decoder and adapter through the production cache."""
+    from safetensors.torch import save_file
+
+    from relax.engine.sft.conditioning import ConditioningRuntime
+    from relax.models.sensenova.model import SenseNovaU1VisionEncoder
+
+    model, data = tiny_conditioning_model
+    vision = (
+        SenseNovaU1VisionEncoder(hidden_size=8, llm_hidden_size=32, patch_size=16, max_position_embeddings_vision=8)
+        .eval()
+        .requires_grad_(False)
+    )
+    # An ordinary registered buffer must also participate in the guard, even
+    # though this extra fixture buffer does not affect the vision calculation.
+    vision.register_buffer("guard_fixture", torch.zeros(2))
+    model.pipe.dit.vision_model = vision
+    original_unit_runner = model.pipe.unit_runner
+
+    def unit_runner(unit, pipe, shared, positive, negative):
+        if unit != 1:
+            return original_unit_runner(unit, pipe, shared, positive, negative)
+        pixels = torch.tensor(list(shared["edit_image"][0].getdata()), dtype=torch.float32)
+        pixels = pixels.reshape(2, 16, 2, 16, 3).permute(0, 2, 4, 1, 3).reshape(4, -1) / 255
+        shared["vision"] = vision(pixel_values=pixels, grid_hw=torch.tensor([[2, 2]])).unsqueeze(0)
+        return shared, positive, negative
+
+    model.pipe.unit_runner = unit_runner
+    checkpoint = tmp_path / "checkpoint"
+    checkpoint.mkdir()
+    save_file(
+        {name: value.contiguous() for name, value in model.state_dict().items()}, checkpoint / "model.safetensors"
+    )
+    monkeypatch.setenv("RELAX_CONDITION_CACHE", "1")
+    monkeypatch.setenv("RELAX_CONDITION_CACHE_MAX_BYTES", str(4 * 1024**2))
+    monkeypatch.setenv("RELAX_CONDITION_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.delenv("RELAX_CONDITION_CACHE_RUN_DIR", raising=False)
+    monkeypatch.setenv("RELAX_CONDITION_PREFETCH_DEPTH", "0")
+    runtime = ConditioningRuntime(
+        model=model,
+        model_path=str(checkpoint),
+        device=torch.device("cpu"),
+        group=None,
+        rank=0,
+        world_size=1,
+        namespace="sensenova-mutation-test",
+        config={},
+        metadata_sha256="fixed-tiny-image",
+        global_batch_size=1,
+        start_step=0,
+        num_steps=3,
+    )
+    try:
+        yield model, data, runtime
+    finally:
+        runtime.close(3, status="complete")
+
+
+def _public_forward(model, data, runtime):
+    torch.manual_seed(42)
+    runtime.begin_step()
+    runtime.sample(0)  # The production entrypoint that actually runs the guard.
+    with torch.no_grad():
+        loss = model(data)
+    return loss, torch.get_rng_state().clone()
+
+
+def test_public_cache_lazy_rope_materialization_keeps_hot_hits(public_conditioning_runtime):
+    model, data, runtime = public_conditioning_runtime
+    vision = model.pipe.dit.vision_model.embeddings
+    rotary = model.pipe.dit.language_model.model.layers[0].self_attn.rotary_emb
+    assert vision.cos_cached_x is None and rotary.inv_freq is None
+    spec_before = model.conditioning_spec(data, {"height": 32, "width": 32}, enabled=True)
+    expected = _public_forward(model, data, runtime)
+    assert runtime._conditioning_snapshot is not None
+    assert vision.cos_cached_x is not None and rotary.inv_freq is not None
+    assert vision.conditioning_rope_cache_is_pristine() and rotary.conditioning_rope_cache_is_pristine()
+    vision.to(device="cpu")  # A no-op device placement must not poison reuse.
+    actual = _public_forward(model, data, runtime)
+    assert all(torch.equal(left, right) for left, right in zip(expected, actual, strict=True))
+    assert runtime._step["effective_hit"] == 1 and runtime._step["encoding_calls"] == 0
+    assert not runtime._cache_guard_disabled
+    assert model.conditioning_spec(data, {"height": 32, "width": 32}, enabled=True) == spec_before
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "attention_scaling",
+        "rope_theta",
+        "rms_epsilon",
+        "attention_scale",
+        "mode",
+        "inv_freq_inplace",
+        "inv_freq_replaced",
+        "vision_rope_inplace",
+        "vision_rope_replaced",
+        "ordinary_buffer_inplace",
+        "ordinary_buffer_replaced",
+        "vision_rope_dtype",
+        "parameter_layout",
+    ],
+)
+def test_public_cache_rejects_changed_nonparameter_conditioning(public_conditioning_runtime, mutation):
+    model, data, runtime = public_conditioning_runtime
+    captured = []
+    original_restore = model._restore_conditioning
+
+    def restore(features, *args):
+        captured.append({name: value.clone() for name, value in features.items()})
+        return original_restore(features, *args)
+
+    model._restore_conditioning = restore
+    _public_forward(model, data, runtime)
+    old_prefix = captured[-1]
+    attention = model.pipe.dit.language_model.model.layers[0].self_attn
+    vision = model.pipe.dit.vision_model
+    if mutation == "attention_scaling":
+        attention.rotary_emb.attention_scaling *= 2
+    elif mutation == "rope_theta":
+        attention.rotary_emb.rope_theta *= 2
+    elif mutation == "rms_epsilon":
+        attention.q_norm.variance_epsilon *= 100
+    elif mutation == "attention_scale":
+        attention.scaling *= 2
+    elif mutation == "mode":
+        attention.train(not attention.training)
+    elif mutation == "inv_freq_inplace":
+        attention.rotary_emb.inv_freq.add_(0.1)
+    elif mutation == "inv_freq_replaced":
+        attention.rotary_emb.inv_freq = attention.rotary_emb.inv_freq + 0.1
+    elif mutation == "vision_rope_inplace":
+        vision.embeddings.cos_cached_x.add_(0.1)
+    elif mutation == "vision_rope_replaced":
+        vision.embeddings.cos_cached_x = vision.embeddings.cos_cached_x + 0.1
+    elif mutation == "ordinary_buffer_inplace":
+        vision.guard_fixture.add_(1)
+    elif mutation == "ordinary_buffer_replaced":
+        vision.guard_fixture = torch.ones(2)
+    elif mutation == "vision_rope_dtype":
+        vision.embeddings.cos_cached_x = vision.embeddings.cos_cached_x.double()
+    elif mutation == "parameter_layout":
+        parameter = vision.embeddings.patch_embedding.weight
+        before = (id(parameter), parameter._version, tuple(parameter.stride()))
+        vision.embeddings.to(memory_format=torch.channels_last)
+        parameter = vision.embeddings.patch_embedding.weight
+        assert (id(parameter), parameter._version) == before[:2]
+        assert tuple(parameter.stride()) != before[2]
+    actual = _public_forward(model, data, runtime)
+    current_prefix = captured[-1]
+    assert runtime._cache_guard_disabled
+    assert runtime._step["effective_hit"] == 0 and runtime._step["encoding_calls"] == 1
+    runtime.force_online = True
+    expected = _public_forward(model, data, runtime)
+    assert all(torch.equal(left, right) for left, right in zip(actual, expected, strict=True))
+    assert all(torch.equal(current_prefix[name], value) for name, value in captured[-1].items())
+    if mutation == "attention_scaling":
+        # The r02 acceptance probe: guard must run after a real warm prefix,
+        # and the stale prefix genuinely differs from the current encoder.
+        assert not torch.equal(old_prefix["kv.0.key"], current_prefix["kv.0.key"])
+
+
+def test_generation_only_update_keeps_public_conditioning_hot(public_conditioning_runtime):
+    model, data, runtime = public_conditioning_runtime
+    _public_forward(model, data, runtime)
+    with torch.no_grad():
+        model.pipe.dit.language_model.model.layers[0].self_attn.q_proj_mot_gen.weight.add_(0.1)
+    actual = _public_forward(model, data, runtime)
+    assert not runtime._cache_guard_disabled
+    assert runtime._step["effective_hit"] == 1 and runtime._step["encoding_calls"] == 0
+    runtime.force_online = True
+    expected = _public_forward(model, data, runtime)
+    assert all(torch.equal(left, right) for left, right in zip(actual, expected, strict=True))
+
+
+def test_rope_known_rebuilds_are_allowed_but_do_not_rebaseline_mutations(public_conditioning_runtime):
+    model, data, runtime = public_conditioning_runtime
+    _public_forward(model, data, runtime)
+    vision = model.pipe.dit.vision_model.embeddings
+    rotary = model.pipe.dit.language_model.model.layers[0].self_attn.rotary_emb
+    for name in ("cos_cached_x", "sin_cached_x", "cos_cached_y", "sin_cached_y"):
+        setattr(vision, name, None)
+    rotary.inv_freq = None
+    # Exercise the same reconstruction helpers used after a device change.
+    vision._ensure_rope_cache(torch.device("cpu"))
+    rotary._ensure_inv_freq(torch.device("cpu"))
+    _public_forward(model, data, runtime)
+    assert not runtime._cache_guard_disabled and runtime._step["effective_hit"] == 1
+    vision.cos_cached_x.add_(0.1)
+    vision._ensure_rope_cache(torch.device("cpu"))  # Already resident: must not bless external writes.
+    vision.to(device="cpu")
+    assert not vision.conditioning_rope_cache_is_pristine()
+    _public_forward(model, data, runtime)
+    assert runtime._cache_guard_disabled and runtime._step["encoding_calls"] == 1
+
+
 def test_prefetch_spec_matches_effective_forward_key_without_rng_or_encoding(tiny_conditioning_model):
     model, data = tiny_conditioning_model
     model.pipe.check_resize_height_width = lambda height, width: (height, width)
@@ -348,7 +545,7 @@ def test_effective_tokenizer_inputs_cover_mutations_without_full_vocabulary_scan
         return model.conditioning_spec(data, {"height": 32, "width": 32}, enabled=True)
 
     original = spec()
-    assert original.name == "sensenova.prefix.v2"
+    assert original.name == "sensenova.prefix.v3"
     tokenizer.added["unused"] = 3
     tokenizer.init_kwargs["nested"] = {"rules": ["unused"]}
     assert spec() == original  # Metadata unused by this input cannot affect its prefix.

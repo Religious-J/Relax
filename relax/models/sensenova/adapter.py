@@ -133,6 +133,78 @@ class SenseNovaSFTModel(torch.nn.Module):
         )
         return parameters
 
+    def _conditioning_modules(self) -> list[tuple[str, torch.nn.Module]]:
+        dit = self.pipe.dit
+        return [(f"vision.{name}", module) for name, module in dit.vision_model.named_modules()] + [
+            (f"prefix.{name}", module)
+            for name, module in dit.language_model.model.named_modules()
+            if "_mot_gen" not in name
+        ]
+
+    def _conditioning_semantic(self) -> dict[str, Any]:
+        """Actual non-tensor forward settings, not just checkpoint config."""
+        from .model import (
+            SenseNovaU1Attention,
+            SenseNovaU1RMSNorm,
+            SenseNovaU1RotaryEmbedding,
+            SenseNovaU1VisionEmbeddings,
+        )
+
+        fields = (
+            (SenseNovaU1RMSNorm, ("variance_epsilon",)),
+            (
+                SenseNovaU1RotaryEmbedding,
+                ("rope_head_dim", "rope_theta", "max_seq_len_cached", "original_max_seq_len", "attention_scaling"),
+            ),
+            (
+                SenseNovaU1Attention,
+                ("head_dim", "num_attention_heads", "num_key_value_heads", "num_key_value_groups", "scaling"),
+            ),
+            (
+                SenseNovaU1VisionEmbeddings,
+                (
+                    "embed_dim",
+                    "llm_embed_dim",
+                    "downsample_factor",
+                    "patch_size",
+                    "rope_dim_part",
+                    "max_position_embeddings_vision",
+                    "rope_theta_vision",
+                ),
+            ),
+            (torch.nn.Conv2d, ("kernel_size", "stride", "padding", "dilation", "groups", "padding_mode")),
+            (torch.nn.GELU, ("approximate",)),
+            (torch.nn.SiLU, ("inplace",)),
+            (torch.nn.Dropout, ("p", "inplace", "training")),
+        )
+        return {
+            name: {"training": module.training, **{field: getattr(module, field) for field in names}}
+            for name, module in self._conditioning_modules()
+            for kind, names in fields
+            if isinstance(module, kind)
+        }
+
+    def _conditioning_buffers(self) -> list[tuple[str, torch.Tensor]]:
+        from .model import SenseNovaU1RotaryEmbedding, SenseNovaU1VisionEmbeddings
+
+        buffers = []
+        for name, module in self._conditioning_modules():
+            derived = ()
+            if isinstance(module, (SenseNovaU1RotaryEmbedding, SenseNovaU1VisionEmbeddings)):
+                # Their helpers record only tensors created by deterministic
+                # lazy initialization/device rebuilding. Check those records
+                # before excluding their changing identities from the guard.
+                if not module.conditioning_rope_cache_is_pristine():
+                    raise ValueError(f"{name} derived RoPE tensors changed outside materialization")
+                if isinstance(module, SenseNovaU1VisionEmbeddings):
+                    derived = ("cos_cached_x", "sin_cached_x", "cos_cached_y", "sin_cached_y")
+            buffers.extend(
+                (f"{name}.buffers.{field}", tensor)
+                for field, tensor in module.named_buffers(recurse=False)
+                if field not in derived
+            )
+        return buffers
+
     def conditioning_is_frozen(self) -> bool:
         """Check the understanding path, excluding the changing generation
         LoRA.
@@ -153,7 +225,7 @@ class SenseNovaSFTModel(torch.nn.Module):
         shared key. Version reads do not copy or synchronize GPU contents.
         """
         parameters = {}
-        for name, parameter in self._conditioning_parameters():
+        for name, parameter in [*self._conditioning_parameters(), *self._conditioning_buffers()]:
             local = parameter.to_local() if hasattr(parameter, "to_local") else parameter
             parameters[name] = {
                 "identity": id(parameter),
@@ -162,10 +234,12 @@ class SenseNovaSFTModel(torch.nn.Module):
                 "requires_grad": parameter.requires_grad,
                 "dtype": str(parameter.dtype),
                 "shape": tuple(parameter.shape),
+                "stride": tuple(parameter.stride()),
             }
         return {
             "frozen": bool(parameters) and not any(value["requires_grad"] for value in parameters.values()),
             "parameters": parameters,
+            "semantic": self._conditioning_semantic(),
         }
 
     def _prepare_conditioning(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -221,6 +295,7 @@ class SenseNovaSFTModel(torch.nn.Module):
                 ],
                 "target_size": [shared["height"], shared["width"]],
                 "dtype": str(self.pipe.torch_dtype),
+                "encoder_semantic": self._conditioning_semantic(),
                 "tokenizer": {
                     "class": f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}",
                     "input_ids": prepared["input_ids"][0].tolist(),
@@ -251,7 +326,7 @@ class SenseNovaSFTModel(torch.nn.Module):
                 "attention": os.environ.get("RELAX_ATTENTION_IMPLEMENTATION", "flash_attention_2"),
                 "deterministic_attention": os.environ.get("RELAX_DETERMINISTIC_ATTENTION", "0"),
             }
-        return ConditioningSpec("sensenova.prefix.v2", dependencies, cacheable)
+        return ConditioningSpec("sensenova.prefix.v3", dependencies, cacheable)
 
     def conditioning_prefetch_spec(self, data: dict[str, Any]) -> ConditioningSpec:
         """Describe an already decoded sample without encoding or using RNG.
