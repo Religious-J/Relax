@@ -33,6 +33,7 @@ def preview(tmp_path, extra=(), **overrides):
         "GPUS_PER_NODE": "8",
         "GLOBAL_BATCH_SIZE": "8",
         "MICRO_BATCH_SIZE": "1",
+        "CACHE_VAE_POSTERIOR": "0",
     }
     env.update(overrides)
     return subprocess.run(["bash", str(SCRIPT), *extra], env=env, capture_output=True, text=True)
@@ -51,6 +52,7 @@ def test_qwen_image_preview_uses_t2i_adapter_and_bounded_cache_without_side_effe
         "width": 512,
         "max_sequence_length": 512,
         "text_encoder_placement": "sharded",
+        "cache_vae_posterior": False,
         "gradient_checkpointing": True,
         "deterministic_attention": False,
         "caption_dropout": 0.0,
@@ -108,6 +110,7 @@ def test_qwen_image_preview_preserves_effective_batch_with_accumulation_and_exac
         {"HEIGHT": "511"},
         {"MAX_SEQUENCE_LENGTH": "513"},
         {"TEXT_ENCODER_PLACEMENT": "offload"},
+        {"CACHE_VAE_POSTERIOR": "true"},
         {"IMAGE_PREFETCH_DEPTH": "1"},
         {"RELAX_CONDITION_PREFETCH_DEPTH": "1"},
     ],
@@ -131,3 +134,17 @@ def test_qwen_image_preview_declares_replicated_encoder_for_both_cache_modes(tmp
         args = json.loads(result.stdout)
         config = json.loads(args[args.index("--t2i-sft-config") + 1])
         assert config["text_encoder_placement"] == "replicated"
+
+
+@pytest.mark.parametrize("placement", ["sharded", "replicated"])
+def test_qwen_image_preview_uses_same_posterior_bundle_policy_for_online_and_cache(tmp_path, placement):
+    configs = []
+    for enabled in ("0", "1"):
+        result = preview(
+            tmp_path, RELAX_CONDITION_CACHE=enabled, TEXT_ENCODER_PLACEMENT=placement, CACHE_VAE_POSTERIOR="1"
+        )
+        assert result.returncode == 0, result.stderr
+        args = json.loads(result.stdout)
+        configs.append(json.loads(args[args.index("--t2i-sft-config") + 1]))
+    assert configs[0] == configs[1]
+    assert configs[0]["cache_vae_posterior"] is True

@@ -4,6 +4,8 @@
 
 The adapter calls resolve inside its normal FSDP root forward. A unanimous
 decision on the existing Gloo group keeps sharded forward collectives aligned.
+Only backend-validated collective-free conditioning can decide rank-locally;
+that execution policy is agreed once and fixed for the runtime lifetime.
 Storage is node-local and run-scoped; it never contains noise or optimizer
 data.
 """
@@ -72,6 +74,29 @@ def unanimous_ready(ready: bool, group: Any) -> bool:
     return bool(flag.item())
 
 
+def agree_execution_policy(model: Any, group: Any) -> str:
+    """Agree once before any rank can take a different collective path.
+
+    The backend grants this capability after checking replica ownership. A
+    cache miss, changed input or poisoned weight guard never changes the
+    execution policy: those conditions may differ between ranks.
+    """
+    try:
+        policy = getattr(model, "_conditioning_execution_policy", "unanimous")
+    except Exception:
+        policy = None
+    local = policy if isinstance(policy, str) and policy in ("unanimous", "rank_local") else None
+    policies = [local]
+    if dist.is_initialized():
+        policies = [None] * dist.get_world_size(group)
+        dist.all_gather_object(policies, local, group=group)
+    if any(value not in ("unanimous", "rank_local") for value in policies):
+        raise ValueError("Invalid backend conditioning execution policy")
+    if any(value != policies[0] for value in policies):
+        raise ValueError("Conditioning execution policy differs between training ranks")
+    return policies[0]
+
+
 def _tensor_bytes(features: dict[str, torch.Tensor]) -> int:
     return sum(tensor.numel() * tensor.element_size() for tensor in features.values())
 
@@ -109,6 +134,7 @@ class ConditioningRuntime:
         self.world_size = world_size
         self._conditioning_started = time.monotonic()
         self._started = self._conditioning_started if trainer_started is None else trainer_started
+        self._execution_policy = agree_execution_policy(model, group)
         self._closed = False
         self._close_event_written = False
         self._events: list[tuple[Any, Any]] = []
@@ -179,6 +205,7 @@ class ConditioningRuntime:
                     "conditioning_init_seconds": time.monotonic() - self._conditioning_started,
                     "total_seconds_scope": "trainer lifetime; model and Ray startup excluded (see external job.json)",
                     "cache_enabled": self.enabled,
+                    "conditioning_execution_policy": self._execution_policy,
                     "prefetch_depth": self.prefetch_depth if self.enabled else 0,
                     "prefetch_max_bytes": prefetch_bytes if self._prefetch is not None else 0,
                     "prefetch_scope": "validated CPU leases; device copies remain on the training thread",
@@ -219,9 +246,9 @@ class ConditioningRuntime:
         """Fail closed on a conditioning-master change outside FSDP forward.
 
         The adapter optionally declares ``frozen`` and named parameter
-        metadata. Other ranks still enter unanimous_ready: one poisoned shard
-        owner makes the whole group compute without adding a collective to the
-        hot path.
+        metadata. Sharded encoders still enter unanimous_ready: one poisoned
+        shard owner makes the whole group compute. A collective-free replica
+        instead bypasses reuse locally without changing its execution policy.
         """
         if self._cache_guard_disabled:
             return
@@ -360,11 +387,16 @@ class ConditioningRuntime:
                 self._step["cache_errors"] += 1
                 if key is not None and self.cache is not None:
                     self.cache.invalidate(key)
-                logger.warning("Conditioning read failed; all ranks will use online encoding: %s", error)
+                logger.warning(
+                    "Conditioning read failed; using online encoding (%s): %s", self._execution_policy, error
+                )
         self._step["cache_lookup_seconds"] += time.perf_counter() - lookup_started
         self._step["local_hit"] += int(local_hit)
         coordinate_started = time.perf_counter()
-        ready = unanimous_ready(local_hit and not self.force_online, self.group) if self.enabled else False
+        ready = local_hit and not self.force_online
+        if self.enabled and self._execution_policy == "unanimous":
+            self._step["coordinate_calls"] += 1
+            ready = unanimous_ready(ready, self.group)
         self._step["coordinate_seconds"] += time.perf_counter() - coordinate_started
         if ready:
             self._step["effective_hit"] += 1
@@ -419,6 +451,7 @@ class ConditioningRuntime:
                 "h2d_wait_seconds",
                 "cache_restore_seconds",
                 "coordinate_seconds",
+                "coordinate_calls",
                 "local_hit",
                 "effective_hit",
                 "miss",

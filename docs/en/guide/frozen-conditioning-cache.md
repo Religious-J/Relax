@@ -77,7 +77,7 @@ SenseNova checks the actual conditioning parameters' `requires_grad` state. Trai
 
 For LoRA training, the adapter uses independent FSDP boundaries for the vision encoder and text embeddings. An effective hit skips their calls and the associated weight all-gathers. The unused language-model head also has its own boundary, so these training steps do not gather its weights. Online and cached runs use the same boundaries; keep this policy in the baseline when measuring reuse.
 
-Image decoding and sample preparation still run before lookup. The cache skips repeated conditioning preprocessing, input transfer, and encoding on an effective hit. It does not cache the supervised target's training computation, sampled noise, timesteps, generated trajectories, or rewards. For adapters with random crops, augmentations, or caption dropout, preserve their normal order and key the resulting effective inputs rather than silently reusing a previous random choice. This integration does not introduce those augmentations into SenseNova. Stochastic VAE outputs are outside its scope.
+Image decoding and sample preparation still run before lookup. The cache skips repeated conditioning preprocessing, input transfer, and encoding on an effective hit. It does not cache the supervised target's training computation, sampled noise, timesteps, generated trajectories, or rewards. For adapters with random crops, augmentations, or caption dropout, preserve their normal order and key the resulting effective inputs rather than silently reusing a previous random choice. This integration does not introduce those augmentations into SenseNova. Qwen optionally reuses deterministic VAE posterior parameters while sampling online every time; see [Text-to-Image SFT](./t2i-sft.md).
 
 ## Storage, ownership, and release
 
@@ -110,6 +110,13 @@ The public declarations are in [`relax/models/generative_sft.py`](../../../relax
 SenseNova additionally supplies `conditioning_state()` for the mutation guard. Its process-local parameter identities detect replacement but never enter a shared cache key. Custom adapters that supply this hook must inspect sharded master metadata outside the FSDP forward boundary, rather than treating FSDP's temporary full-parameter views as encoder replacements.
 
 Each rank can require different inputs. Before skipping an encoder, the runtime requires every rank in the FSDP parameter-sharding group to have valid conditions for its own inputs. If any rank misses or fails to restore a payload, all ranks run the online encoder for that microstep. This keeps FSDP collectives aligned. A local hit can therefore become a forced recomputation; use the effective hit rate when interpreting results.
+
+Complete frozen replicas can instead use rank-local decisions. The adapter declares
+the conditioning modules; the backend validates native FSDP exclusion, no nested
+FSDP boundaries and no distributed parameters. The adapter must additionally ensure
+that compute/restore contain no explicit collectives. The runtime agrees on the
+policy once and fixes it for its lifetime. Unanimous decisions remain the default;
+content keys, mutation guards, capacity and release rules are unchanged.
 
 Missing files, checksum failures, or adapter schema/shape errors fall back to online computation. A bad key is invalidated without clearing unrelated entries; deletion waits for outstanding borrows. The storage layer has no knowledge of SenseNova layer names. Another SFT adapter can use the same resolver and cache contract. Future RL integration would need to define its own dependencies, ownership, and distributed skip boundary; no RL feature handoff is provided here.
 

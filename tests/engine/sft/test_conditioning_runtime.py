@@ -33,7 +33,14 @@ def runtime_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("RELAX_CONDITION_PROFILE", "1")
     runtimes = []
 
-    def make(*, enabled: bool = True, telemetry: bool = False, start_step: int = 0, num_steps: int = 2):
+    def make(
+        *,
+        enabled: bool = True,
+        telemetry: bool = False,
+        start_step: int = 0,
+        num_steps: int = 2,
+        execution_policy: str = "unanimous",
+    ):
         index = len(runtimes)
         directory = tmp_path / f"run-{index}"
         monkeypatch.setenv("RELAX_CONDITION_CACHE", str(int(enabled)))
@@ -44,6 +51,7 @@ def runtime_factory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         else:
             monkeypatch.delenv("RELAX_CONDITION_CACHE_RUN_DIR", raising=False)
         model = DummyModel()
+        model._conditioning_execution_policy = execution_policy
         runtime = conditioning.ConditioningRuntime(
             model=model,
             model_path="unused-model-path",
@@ -163,11 +171,12 @@ def _fake_cuda_events(runtime, monkeypatch, actions):
     monkeypatch.setattr(conditioning.torch.cuda, "synchronize", forbidden_sync)
 
 
+@pytest.mark.parametrize("execution_policy", ["unanimous", "rank_local"])
 @pytest.mark.parametrize("failure", ["copy", "restore"])
 def test_cuda_copy_failure_drains_event_before_lease_close_and_unanimous_fallback(
-    runtime_factory, monkeypatch, failure
+    runtime_factory, monkeypatch, failure, execution_policy
 ):
-    runtime, _, _ = runtime_factory()
+    runtime, _, _ = runtime_factory(execution_policy=execution_policy)
     actions = []
     _fake_cuda_events(runtime, monkeypatch, actions)
     expected = torch.tensor([1.0, -2.0], dtype=torch.bfloat16)
@@ -214,11 +223,11 @@ def test_cuda_copy_failure_drains_event_before_lease_close_and_unanimous_fallbac
     monkeypatch.setattr(conditioning, "unanimous_ready", vote)
     result = runtime.resolve(_spec(), compute, _restore)
     assert torch.equal(result["condition"], expected)
-    assert votes == [False], "Copy/restore failure must reach the one shared decision before online compute"
+    assert votes == ([False] if execution_policy == "unanimous" else [])
     assert actions.index("event_record") < actions.index("event_wait") < actions.index("lease_close")
-    assert (
-        actions.index("lease_close") < actions.index("invalidate") < actions.index("vote") < actions.index("compute")
-    )
+    assert actions.index("lease_close") < actions.index("invalidate") < actions.index("compute")
+    if execution_policy == "unanimous":
+        assert actions.index("invalidate") < actions.index("vote") < actions.index("compute")
     assert runtime._step["cache_errors"] == 1
     assert (
         runtime._step["condition_h2d_bytes"]
@@ -291,8 +300,103 @@ def test_local_hit_with_missing_peer_forces_online_but_preserves_entry(runtime_f
     assert len(calls) == 2
 
 
-def test_invalid_restore_schema_is_invalidated_and_rebuilt_online(runtime_factory, monkeypatch):
-    runtime, _, _ = runtime_factory()
+def test_rank_local_policy_is_fixed_and_skips_readiness_votes(runtime_factory, monkeypatch):
+    runtime, model, directory = runtime_factory(execution_policy="rank_local", telemetry=True)
+    expected = torch.tensor([1, -2, 3], dtype=torch.bfloat16)
+    calls = []
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("Collective-free conditioning must not vote on a cache result")
+
+    def compute():
+        calls.append(1)
+        return {"value": expected.clone()}
+
+    monkeypatch.setattr(conditioning, "unanimous_ready", forbidden)
+    runtime.resolve(_spec(), compute, _restore)
+    # The runtime must not re-read mutable declarations during training.
+    model._conditioning_execution_policy = "unanimous"
+    actual = runtime.resolve(_spec(), compute, _restore)
+    assert torch.equal(actual["condition"], expected) and actual["condition"].dtype == expected.dtype
+    assert len(calls) == 1 and runtime._step["effective_hit"] == 1
+    assert runtime._step["forced_recompute"] == 0
+    assert runtime._step["coordinate_calls"] == 0
+    runtime.force_online = True
+    runtime.resolve(_spec(), compute, _restore)
+    runtime.force_online = False
+    runtime.resolve(_spec(), compute, _restore)
+    assert len(calls) == 2
+    init = json.loads((directory / "events-rank0.jsonl").read_text().splitlines()[0])
+    assert init["conditioning_execution_policy"] == "rank_local"
+
+
+@pytest.mark.parametrize("policy", ["unanimous", "rank_local"])
+def test_execution_policy_is_agreed_once_per_runtime(runtime_factory, monkeypatch, policy):
+    calls = []
+    original = conditioning.agree_execution_policy
+
+    def agree(model, group):
+        calls.append((model, group))
+        return original(model, group)
+
+    monkeypatch.setattr(conditioning, "agree_execution_policy", agree)
+    runtime, model, _ = runtime_factory(execution_policy=policy)
+    for _ in range(3):
+        runtime.resolve(_spec(), lambda: {"value": torch.ones(2)}, _restore)
+    assert calls == [(model, None)]
+
+
+@pytest.mark.parametrize("policy", [None, "sometimes", True, ["rank_local"]])
+def test_invalid_backend_policy_is_rejected_before_cache_creation(runtime_factory, monkeypatch, policy):
+    monkeypatch.setattr(conditioning, "ConditioningCache", lambda *_args: pytest.fail("Must reject before cache init"))
+    with pytest.raises(ValueError, match="Invalid backend conditioning execution policy"):
+        runtime_factory(execution_policy=policy)
+
+
+@pytest.mark.parametrize("policy", ["unanimous", "rank_local"])
+@pytest.mark.parametrize("peer", ["unanimous", "rank_local", None])
+def test_cross_rank_policy_disagreement_fails_before_hot_path(monkeypatch, policy, peer):
+    model = DummyModel()
+    model._conditioning_execution_policy = policy
+    group = object()
+    calls = []
+    monkeypatch.setattr(conditioning.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(conditioning.dist, "get_world_size", lambda given: 2 if given is group else pytest.fail())
+
+    def gather(values, value, *, group):
+        calls.append((value, group))
+        values[:] = [value, peer]
+
+    monkeypatch.setattr(conditioning.dist, "all_gather_object", gather)
+    if peer == policy:
+        assert conditioning.agree_execution_policy(model, group) == policy
+    else:
+        with pytest.raises(ValueError, match="conditioning execution policy|Conditioning execution policy"):
+            conditioning.agree_execution_policy(model, group)
+    assert calls == [(policy, group)]
+
+
+def test_undeclared_backend_policy_defaults_to_unanimous(monkeypatch):
+    monkeypatch.setattr(conditioning.dist, "is_initialized", lambda: False)
+    assert conditioning.agree_execution_policy(DummyModel(), None) == "unanimous"
+
+
+def test_rank_local_compute_failure_propagates_and_runtime_can_close(runtime_factory, monkeypatch):
+    runtime, model, _ = runtime_factory(execution_policy="rank_local")
+    monkeypatch.setattr(conditioning, "unanimous_ready", lambda *_args: pytest.fail("Unexpected readiness vote"))
+
+    def fail():
+        raise RuntimeError("encoding failed")
+
+    with pytest.raises(RuntimeError, match="encoding failed"):
+        runtime.resolve(_spec(), fail, _restore)
+    runtime.close(0, status="error")
+    assert model.conditioning_cache is None
+
+
+@pytest.mark.parametrize("execution_policy", ["unanimous", "rank_local"])
+def test_invalid_restore_schema_is_invalidated_and_rebuilt_online(runtime_factory, monkeypatch, execution_policy):
+    runtime, _, _ = runtime_factory(execution_policy=execution_policy)
     spec = _spec()
     key = build_key({"weights": runtime.fingerprint, "schema": spec.name, "dependencies": spec.dependencies})
     assert runtime.cache.put(key, {"wrong_field": torch.ones(3, dtype=torch.bfloat16)})
@@ -338,9 +442,12 @@ def test_uncacheable_conditions_preserve_fp32_gradient_and_cleanup(runtime_facto
     assert torch.equal(model.weight.grad, expected), "Cleanup must not clear the optimizer's FP32 gradients"
 
 
+@pytest.mark.parametrize("execution_policy", ["unanimous", "rank_local"])
 @pytest.mark.parametrize("mutation", ["copy", "unfreeze_refreeze", "replace"])
-def test_conditioning_mutation_permanently_bypasses_stale_entries(runtime_factory, monkeypatch, mutation):
-    runtime, model, directory = runtime_factory(telemetry=True, num_steps=3)
+def test_conditioning_mutation_permanently_bypasses_stale_entries(
+    runtime_factory, monkeypatch, mutation, execution_policy
+):
+    runtime, model, directory = runtime_factory(telemetry=True, num_steps=3, execution_policy=execution_policy)
     model.weight.requires_grad_(False)
 
     def state():
@@ -400,7 +507,7 @@ def test_conditioning_mutation_permanently_bypasses_stale_entries(runtime_factor
     result = runtime.resolve(_spec(), compute, _restore)
     assert torch.equal(result["condition"], torch.ones(3) * 3)
     assert runtime._cache_guard_disabled and model.conditioning_reuse_disabled
-    assert len(calls) == 2 and votes == [False]
+    assert len(calls) == 2 and votes == ([False] if execution_policy == "unanimous" else [])
     runtime.sample(0)
     runtime.resolve(_spec(), compute, _restore)
     assert runtime._cache_guard_reason == first_reason
@@ -839,6 +946,129 @@ def test_real_gloo_group_requires_unanimous_readiness(tmp_path):
             assert not process.is_alive(), "A cache-readiness vote stranded a Gloo rank"
             assert process.exitcode == 0
         assert sorted(queue.get(timeout=2) for _ in processes) == [(0, False, True, False), (1, False, True, False)]
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=3)
+        queue.close()
+        queue.join_thread()
+
+
+def _gloo_rank_local_worker(rank, root, queue):
+    import os
+
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    from relax.backends.fsdp.runtime import resolve_conditioning_execution_policy
+
+    root = Path(root)
+    os.environ["RELAX_CONDITION_CACHE"] = "1"
+    os.environ["RELAX_CONDITION_CACHE_DIR"] = str(root / "cache")
+    os.environ["RELAX_CONDITION_CACHE_MAX_BYTES"] = str(1024**2)
+    os.environ["RELAX_CONDITION_PREFETCH_DEPTH"] = "0"
+    os.environ.pop("RELAX_CONDITION_CACHE_RUN_DIR", None)
+    dist.init_process_group(
+        "gloo", init_method=f"file://{root / 'rendezvous'}", rank=rank, world_size=2, timeout=timedelta(seconds=15)
+    )
+    group = dist.new_group(backend="gloo", timeout=timedelta(seconds=15))
+    runtime = None
+    try:
+        mesh = DeviceMesh.from_group(group, device_type="cpu")
+        for distributed_kind in ("parameter", "buffer"):
+            boundary = torch.nn.Module()
+            boundary.encoder = torch.nn.Linear(4, 4).eval().requires_grad_(False)
+            value = DTensor.from_local(torch.ones(4), device_mesh=mesh, placements=[Replicate()], run_check=False)
+            if distributed_kind == "parameter":
+                boundary.encoder.bias = torch.nn.Parameter(value, requires_grad=False)
+            else:
+                boundary.encoder.register_buffer("distributed_buffer", value)
+            boundary._conditioning_collective_free_modules = (boundary.encoder,)
+            with pytest.raises(ValueError, match="distributed parameters or buffers"):
+                resolve_conditioning_execution_policy(boundary, [boundary.encoder])
+        model = DummyModel()
+        model._conditioning_execution_policy = "unanimous" if rank == 0 else "rank_local"
+        with pytest.raises(ValueError, match="differs between training ranks"):
+            conditioning.agree_execution_policy(model, group)
+        model._conditioning_execution_policy = None if rank == 0 else "rank_local"
+        with pytest.raises(ValueError, match="Invalid backend conditioning execution policy"):
+            conditioning.agree_execution_policy(model, group)
+        model._conditioning_execution_policy = "rank_local"
+        runtime = conditioning.ConditioningRuntime(
+            model=model,
+            model_path=str(root / "model"),
+            device=torch.device("cpu"),
+            group=group,
+            rank=rank,
+            world_size=2,
+            namespace=f"rank-local-test-{rank}",
+            config={},
+            metadata_sha256="test",
+            global_batch_size=2,
+            start_step=0,
+            num_steps=3,
+        )
+        expected = torch.tensor([rank + 1, -2], dtype=torch.bfloat16)
+
+        def compute():
+            return {"value": expected.clone()}
+
+        def forbidden(*_args, **_kwargs):
+            raise AssertionError("Rank-local resolver attempted a readiness vote")
+
+        conditioning.unanimous_ready = forbidden
+        if rank == 0:
+            runtime.resolve(_spec(), compute, _restore)  # Only one rank has a warm cache.
+        records = []
+        for phase in range(3):
+            runtime.begin_step()
+            if phase == 1 and rank == 1:
+                key = runtime._conditioning_key(_spec())
+                assert runtime.cache.invalidate(key)
+                assert runtime.cache.put(key, {"wrong_field": expected})
+            runtime.force_online = phase == 2 and rank == 0
+            actual = runtime.resolve(_spec(), compute, _restore)["condition"]
+            assert torch.equal(actual, expected) and actual.dtype == torch.bfloat16
+            weight = torch.nn.Parameter(torch.tensor(2.0, dtype=torch.float32))
+            (actual.float() * weight).square().sum().backward()
+            assert torch.equal(weight.grad, 4 * expected.float().square().sum())
+            # The next shared operation must have the same sequence on both
+            # ranks despite mixed hits, a bad cache entry or force_online.
+            marker = torch.tensor(float(rank + phase))
+            dist.all_reduce(marker, group=group)
+            assert marker.item() == 1 + 2 * phase
+            records.append(
+                (runtime._step["effective_hit"], runtime._step["encoding_calls"], runtime._step["cache_errors"])
+            )
+        queue.put((rank, records))
+    finally:
+        if runtime is not None:
+            runtime.close(3)
+        dist.destroy_process_group(group)
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="CPU Gloo is required")
+def test_real_gloo_rank_local_mixed_hits_and_restore_failure_preserve_collective_order(tmp_path):
+    (tmp_path / "model").mkdir()
+    (tmp_path / "model" / "weights.safetensors").write_bytes(b"content fingerprint only")
+    context = mp.get_context("spawn")
+    queue = context.Queue()
+    processes = [
+        context.Process(target=_gloo_rank_local_worker, args=(rank, str(tmp_path), queue)) for rank in range(2)
+    ]
+    try:
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=30)
+            assert not process.is_alive(), "Mixed cache results stranded a rank-local worker"
+            assert process.exitcode == 0
+        assert sorted(queue.get(timeout=2) for _ in processes) == [
+            (0, [(1, 0, 0), (1, 0, 0), (0, 1, 0)]),
+            (1, [(0, 1, 0), (0, 1, 1), (1, 0, 0)]),
+        ]
     finally:
         for process in processes:
             if process.is_alive():

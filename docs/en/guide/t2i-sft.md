@@ -76,19 +76,38 @@ bounded feature-cache budget.
 
 ## Cache contract and measurement
 
-Only deterministic frozen `prompt_embeds` are reused. The common runtime hashes
+By default, only deterministic frozen `prompt_embeds` are reused. The common runtime hashes
 checkpoint contents; the adapter declares effective token IDs, attention mask,
 template, truncation, encoder configuration, attention settings and dtype.
 Image filenames do not authorize reuse. Target VAE posterior sampling, diffusion
 noise and timesteps execute every time. Encoder mutation or unfreezing disables
 reuse of old entries.
 
+Optional `CACHE_VAE_POSTERIOR=1` (`cache_vae_posterior: true` in the config)
+stores text embeddings and deterministic VAE posterior parameters in one bounded
+entry. The key also covers the actual augmented RGB pixels, dimensions,
+normalization and VAE configuration. Posterior `sample()` still runs at its
+original position for every microbatch, followed by diffusion noise and timestep
+sampling; sampled latents are never cached. This mode requires VAE tiling and
+slicing to be disabled. Reuse requires the same effective image/caption pair;
+identical captions across different target images are no longer reused separately.
+Crops and caption dropout keep their normal execution order and key their actual outputs.
+
+This option keeps the frozen VAE resident on each GPU using native `ignored_params`.
+Use the same `CACHE_VAE_POSTERIOR` for online and cached comparisons: a change in
+weight placement must not be counted as feature reuse. It defaults off and adds
+resident weights and cache payload; measure both low-reuse costs and repeated epochs.
+
 Set `RELAX_CONDITION_CACHE=0` for online encoding. The cache owns immutable
 tensor snapshots within one training attempt; consumers own independent tensors.
 The example allows 1 GiB of payload per node and an independent 1 GiB of write
 staging, plus metadata and in-flight tensors. LRU eviction respects active leases.
-Missing, corrupt or oversized entries fall back to online computation. FSDP ranks
-agree on hits before skipping encoder collectives. Completion and caught errors
+Missing, corrupt or oversized entries fall back to online computation. Ranks agree
+on hits before skipping sharded encoder collectives. An adapter may declare that
+all conditioning modules are complete frozen replicas with no branch collectives;
+after backend validation, each rank can decide hits and fallback independently.
+The runtime agrees on this execution policy at initialization and keeps it fixed,
+including after cache misses or weight invalidation. Completion and caught errors
 close run-owned resources; dead-owner recovery reclaims entries after forced
 termination.
 
@@ -112,8 +131,8 @@ feature reuse.
 committed `t2i_sft/iter_*`, including optimizer, scheduler, per-rank RNG and sampler
 cursor. `STEPS` is the total number of updates to reach. Exact resume checks the
 model/data/batch/LoRA/training contract. A warm cache is not required to resume.
-Text encoder placement is part of that contract; use the same
-`TEXT_ENCODER_PLACEMENT` when restoring a checkpoint. Both placements save the
+Text encoder placement and posterior reuse are part of that contract; use the same
+`TEXT_ENCODER_PLACEMENT` and `CACHE_VAE_POSTERIOR` when restoring a checkpoint. Both placements save the
 trainable DiT LoRA weights rather than adding frozen encoder weights to the
 adapter checkpoint.
 

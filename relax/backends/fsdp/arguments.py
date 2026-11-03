@@ -763,6 +763,7 @@ def validate_t2i_sft_config(args: Namespace) -> None:
         "width": 512,
         "max_sequence_length": 512,
         "text_encoder_placement": "sharded",
+        "cache_vae_posterior": False,
         "gradient_checkpointing": True,
         "deterministic_attention": False,
         "caption_dropout": 0.0,
@@ -791,7 +792,7 @@ def validate_t2i_sft_config(args: Namespace) -> None:
         config["text_encoder_placement"] not in ("sharded", "replicated"),
         "text_encoder_placement must be sharded or replicated",
     )
-    for field in ("gradient_checkpointing", "deterministic_attention", "random_crop"):
+    for field in ("gradient_checkpointing", "deterministic_attention", "random_crop", "cache_vae_posterior"):
         _fail(errors, type(config[field]) is not bool, f"{field} must be boolean")
     dropout = config["caption_dropout"]
     _fail(errors, type(dropout) not in (int, float) or not 0 <= dropout <= 1, "caption_dropout must be in [0, 1]")
